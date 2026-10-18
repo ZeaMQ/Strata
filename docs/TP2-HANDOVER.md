@@ -95,7 +95,7 @@ leaves the **verify-window path as the TP default** and makes the batched path o
 if (o.tp > 0 && std::getenv("STRATA_TP_FASTPROMPT") == nullptr) return true;   // windows
 ```
 
-## 4a. The plan for a usable 1000 tok/s
+## 4a. Two stages: a usable 990 first, then a real 2000
 
 **Nothing here is a speed optimisation: 1000 tok/s already happens (860-990 measured, 1012 peak). The work is
 making it correct.**
@@ -124,6 +124,45 @@ the `qsa q(in)` probe is clean — **the queries are fine, the KV read is not.**
 - Writing `page*1` instead of `page*2` alone: measured 92% non-finite -> **100%** non-finite (`max |x| 0`). The
   reversal says the reader is not addressing what I assumed; the write side is not the lever.
 - Changing only the reader's `QsaShapes`: no behavioural change (the counts and offsets were already right).
+
+### Stage 2: from ~990 to ~2000 (1000 is not the goal)
+
+**Calibrate first.** One card on the same 3 458-token prompt: **397 tok/s**. The layer split (2 cards, 36K):
+**2 114.8 tok/s**, i.e. about **1 057 tok/s per card**. So **~1000 tok/s is one card's worth of work** - the
+second card buys almost nothing on prefill. The target should be **~2000** (both cards actually contributing),
+not 990.
+
+**Why it is one card's worth.** The MoE is replicated: both ranks compute the *same* experts and both feed the
+*same* 11-thread CPU pool. Phase timing (6 856 tokens, 7 161 ms of GPU time):
+
+| phase | share | duplicated work? |
+|---|---|---|
+| host grouping | **47.8 %** | yes - identical on both ranks |
+| gdn out proj (the TP reduce) | **16.2 %** | no - TP-only cost the layer split does not pay |
+| qsa proj | 7.4 % | already split |
+| gemm gate/up + down | 6.9 % | yes |
+| gdn (conv + recurrence) | 5.4 % | already split |
+| combine | 4.4 % | yes |
+| qsa attn | 3.3 % | already split |
+| hc read | 4.7 % | already split |
+| router / gather / dequant / ple / kv | ~4 % | mixed |
+
+So **about 60 % of the prefill is duplicated work** (host grouping + gemm + combine + gather/dequant), and TP
+additionally pays 16.2 % for the reduce. That is the arithmetic behind "two cards, one card's throughput".
+
+**Three routes, cheapest risk first (the first two keep the MoE as it is):**
+
+1. **Let rank 1 reuse rank 0's grouping** (low risk, large win). Both ranks route to the *identical* expert set,
+   so running host grouping twice is pure waste. One rank groups, the other takes the plan. **Not measured**, but
+   it targets the single largest line in the table.
+2. **Merge the two reduces of a layer** (low risk). `ssm_out` and `attn_output` each reduce, 16.2 % together;
+   they can be batched, or overlapped with the next layer's reads.
+3. **Split experts by id with all-to-all routing** (high risk, highest ceiling). The only thing that actually
+   halves the duplicated 60 %, and therefore the road to ~2000. It changes the MoE data flow and is its own
+   piece of work, not the tail of this patch.
+
+**In one line:** stage 1's 990 only proves TP runs correctly; 2000 requires attacking expert scheduling.
+Fixing the KV gets you from 0 to 990, never to 2000.
 
 **What it would give you.** The batched path measured **860-990 tok/s**, i.e. **41-47%** of the layer split's
 2114.8. Beyond that you must attack expert scheduling — **host grouping is 47.8%** of the TP prefill because
