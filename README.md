@@ -1,33 +1,104 @@
-> ### 这是一个 fork，不是 Strata 本体
+> # 这是一个 fork，不是 Strata 本体
 >
-> 它只为一件事存在：交接一个未完成的实验——两张 RTX 3080 上的张量并行（`--tp 2`）。
-> **它不可用**：能跑通的那条路径约为现有层切分 prefill 吞吐的 **2%**，快速路径还会产生非有限 logits。
-> 分支 `tp2-wip` 是 `296b59d2`（引擎 0.1.44.1）之上的一次提交；上游项目在
+> 它只为一件事存在：交接一个**未完成、不可用**的实验——两张 RTX 3080 上的张量并行（`--tp 2`）。
+> 分支 `tp2-wip` 是 `296b59d2`（引擎 **0.1.44.1**）之上的提交；上游项目在
 > [Niko1221/Strata](https://github.com/Niko1221/Strata)。
 >
-> **先读交接文档：[/docs/TP2-HANDOVER.zh-CN.md](docs/TP2-HANDOVER.zh-CN.md)（中文）· [/docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md)（English）**
+> ## 速度（这是本文最重要的一节，请先看）
 >
-> 差异：[main...tp2-wip](https://github.com/ZeaMQ/Strata/compare/main...tp2-wip)。
-> 相关上游 issue：[#156](https://github.com/Niko1221/Strata/issues/156)（当年以"暂不计划"关闭，
-> 本交接里的实测支持那个判断）、[#3025](https://github.com/Niko1221/Strata/issues/3025)（本交接，已由我关闭）。
+> | 路径 | prefill | decode | 状态 |
+> |---|---|---|---|
+> | batched 快路径（`STRATA_TP_FASTPROMPT=1`） | **860–990 tok/s**（最高一次 1012） | — | ❌ 读完 N−5 个 token 后产生非有限 logits，**不可用** |
+> | verify 窗口路径（**默认**） | **37–52 tok/s** | 37–58 tok/s | ✅ 全长度正确 |
+> | 层切分（原版 PP，同机同 pack 同日） | **2114.8 tok/s** | 99.3 tok/s | ✅ 参照基准 |
+>
+> 也就是说：**能用的路径约为层切分的 2%，而接近 1000 tok/s 的那条是坏的。**
+> 1000 tok/s 不是一个可以引用的成绩，它是一个"跑到最后 5 个 token 就坏"的中间态。
+>
+> ## 能用的部分（实测，prompt 走 verify 窗口）
+>
+> | prompt token | 读取 | prefill | decode |
+> |---|---|---|---|
+> | 108 | 108 / 108 | 43.6 tok/s | 37.4 tok/s |
+> | 3 458 | 3 458 / 3 458 | 37.7 tok/s | 45.9 tok/s |
+> | 6 856 | 6 856 / 6 856 | 52.1 tok/s | 58.4 tok/s |
+> | 14 060 | 14 060 / 14 060 | 41.3 tok/s | 43.4 tok/s |
+>
+> - 上述长度均无非有限 logits；能完整生成；视觉、MTP、`--kv-resident`、`--spec` 均可用。
+> - 每卡显存 **19 909 / 19 867 MiB（19.44 / 19.40 GB）**，与层切分（19 399 / 19 957 MiB）持平。
+>
+> ## 不能用的部分
+>
+> 快路径超过一个 KV page 就坏：
+> ```
+> strata serve: non-finite logits (#879) in a prompt window at position 6851 (row 0)
+> strata serve: prompt 6856 tokens = 0 reused + 6851 of 6856 read in 7972 ms (859.4 tok/s)
+> ```
+> 因此批量路径被做成 opt-in，**verify 窗口是 TP 的默认**。
+>
+> ## 定位到哪一步（证据）
+>
+> - **单卡对照**（同一二进制、同一 3 458-token prompt）：单卡 3 458/3 458 正常；双卡 3 453/3 458 后崩。
+>   单卡**不存在**"批量写入 → 窗口读取"这条衔接，TP 有。
+> - **强制走窗口**（`STRATA_TP_WINDOWS=1`）：3 458/3 458 正确 → reduce、GDN、MoE、显存都是好的。
+> - **`STRATA_DBG_GDN=1`**（本补丁新增）给出的断面：
+>   ```
+>   layer 0/1/2  GDN 块        干净
+>   layer 3      qsa q(in)     干净            ← 查询本身没问题
+>   layer 3      qsa attn      583872/635904 非有限（max |x| 2.288e+06）
+>   layer 3      qsa bo(reduce) 527360/529920 非有限
+>   layer 4      GDN 块        整块非有限（下游结果）
+>   ```
+> - 从运行中的内核打出的配置：`staged=1  kv_mode=1  page_size=4  s.n_head_kv=2`
+>   ——**`page_size` 是 4 不是 64**，早前一批基于 64 的推断全部作废，这是 13 次失败的主因之一。
+> - 页步长两个方向都试过并回退：写 `page*2`/读 `page*1` → 92% 非有限；写 `page*1`/读 `page*1` → **100%**
+>   非有限。**这个反向变化说明读端寻址不是我以为的那样，写端不是杠杆。**
+>
+> ## 顺带挖出的两个真 bug（与 TP 无关，单卡也有价值）
+>
+> 1. **QSA 查询步长不一致**：`split_q_kernel` 把 rank 的 query head 按 `qh*256` 紧密排列，
+>    `rope`/`rms_rows`/`gate_attn` 也都按 3072 寻址，但两个注意力调用点仍用模型全量的 6144。
+> 2. **专家缓存尺寸**：重试按固定 3/4 缩小，且读的是上下文建立前的空闲值，实际空闲 13.29 GiB 时
+>    只分配了 11.46 GiB——白扔 1.83 GiB。改为按 `device_free_bytes()` 填充后，显存才到 19.44 GB。
+>
+> ## 为什么还要做：因为 #156
+>
+> 上游 [#156](https://github.com/Niko1221/Strata/issues/156) 已于 2026-09-30 以"暂不计划"关闭，
+> 理由是"decode 受专家限制，切 dense 部分收益很小"；基线 `docs/MULTI_GPU.md` 也明说"这是层并行，
+> **不是张量并行**"，基线里 TP 代码为零。**本文不是功能提案，而是 #156 当初缺的那份实测——而数据支持
+> 那个判断**：分段计时显示 **host grouping 占 TP prefill 的 47.8%**（两 rank 的专家挤同一个 CPU pool），
+> TP 的 reduce 再占 **16.2%**。
+>
+> ## 没测什么
+>
+> 只编了 CUDA（`AGENTS.md` 要求 CUDA+HIP+SYCL）；只有一台机器、一个 pack、一个模型；**没测 50K–100K**
+> （正确路径约 40 tok/s，单次约 20 分钟，我只测到 14 060 token）；**没做质量评估**（只验了 `12*7→84`、
+> token 数完整、无非有限行，没跑召回/困惑度）；**没做单卡逐位回归**；没做长时间稳定性测试。
+>
+> ## 接手从哪开始
+>
+> 1. 在 `kv_append_kernel` 里打印它对前 8 个 cell 写入 stage 的 `row_id`，
+>    与 `prompt_attn_kernel` 对同 8 个 cell 算出的 `r` 逐值对比。
+> 2. dump `m.ident_table`（`prefill.cpp:1204` 构建），确认 `ident[i] == i`。
+> 3. 记住 `page_size == 4`，block 数是 `cells / 4`。
+>
+> ## 文档
+>
+> - 中文完整版：[/docs/TP2-HANDOVER.zh-CN.md](docs/TP2-HANDOVER.zh-CN.md)
+> - English：[/docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md)
+> - 代码差异：[main...tp2-wip](https://github.com/ZeaMQ/Strata/compare/main...tp2-wip)（39 个文件）
+> - 上游 issue：[#3025](https://github.com/Niko1221/Strata/issues/3025)（本交接，已由我关闭）
+>
+> **来源：** AI 辅助、跨多次长时间会话完成，**未经人工 review**；快速路径经过 **13 次**独立修复尝试仍未解决。
 >
 > ---
 >
-> ### This is a fork, not Strata
->
-> It exists to hand over one unfinished experiment: tensor parallel (`--tp 2`) on two RTX 3080s.
-> **It is not usable** — the one working path is about **2%** of the existing layer split's prompt
-> throughput, and its fast path produces non-finite logits. Branch `tp2-wip` is one commit on top of
-> `296b59d2` (engine 0.1.44.1); the upstream project is
-> [Niko1221/Strata](https://github.com/Niko1221/Strata).
->
-> **Read [/docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md) (English) or
-> [/docs/TP2-HANDOVER.zh-CN.md](docs/TP2-HANDOVER.zh-CN.md) (中文) first.**
->
-> Diff: [main...tp2-wip](https://github.com/ZeaMQ/Strata/compare/main...tp2-wip).
-> Upstream issues: [#156](https://github.com/Niko1221/Strata/issues/156) (closed as not planned; the
-> measurements here support that decision) and [#3025](https://github.com/Niko1221/Strata/issues/3025)
-> (this handover, closed by me).
+> **This is a fork, not Strata.** It hands over one unfinished, **not usable** experiment: tensor parallel
+> (`--tp 2`) on two RTX 3080s. Branch `tp2-wip`, on top of `296b59d2` (engine 0.1.44.1).
+> **Speeds:** the fast path measures 860–990 tok/s but produces non-finite logits (broken); the path that
+> works runs at 37–52 tok/s, about **2%** of the layer split's 2114.8 tok/s on the same machine.
+> Read [docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md) first. Not human-reviewed; thirteen fix attempts did not
+> resolve the remaining defect.
 >
 > ---
 >
