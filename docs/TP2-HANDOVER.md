@@ -95,6 +95,40 @@ leaves the **verify-window path as the TP default** and makes the batched path o
 if (o.tp > 0 && std::getenv("STRATA_TP_FASTPROMPT") == nullptr) return true;   // windows
 ```
 
+## 4a. The plan for a usable 1000 tok/s
+
+**Nothing here is a speed optimisation: 1000 tok/s already happens (860-990 measured, 1012 peak). The work is
+making it correct.**
+
+**Where the fast path differs.** The default reads the prompt in 6-token verify windows; the fast path runs one
+batched prefill. The only real difference is *how the KV is written*: the batched path writes N cells at once
+(`kv_append`), the window path writes 5-6 cells per step (`kv_append_q8_step`), while the decode and the window
+have **one** read algorithm. Two writers with different page rows plus one reader cannot all agree.
+
+**Why it fails now.** After the batched append writes N-5 tokens, the first read (the short-read window or the
+first decode token) does not get those cells: `qsa attn 583872 of 635904 non-finite (max |x| 2.288e+06)`, while
+the `qsa q(in)` probe is clean — **the queries are fine, the KV read is not.**
+
+**Repair order, cheapest first.**
+1. **Compare the two numbers.** Print `row_id` for the first 8 cells inside `kv_append_kernel`, and `r` for the
+   same cells where `srow` is filled in `src/kernels/cuda/qsa_prompt_attn.cu`. If they differ, that is the defect.
+2. **Check `ident_table`.** `prefill.cpp:1204` builds it; when `staged=1` the reader is
+   `pools_of(m.stage, m.ident_table)`. Confirm `ident[i] == i` rather than some permutation.
+3. **Remember `page_size == 4`.** Block count is cells/4; anything derived from 64 has to be redone — a whole
+   family of my earlier deductions died on this.
+4. If step 1 shows the numbers *agree* yet the output is still bad, the defect is in how the stage pool is
+   **filled** (`kv_stage_from_host` and the `stage` argument of `kv_append`), not in the row arithmetic. I
+   changed that path but never proved it.
+
+**Two things that do not work (do not repeat them).**
+- Writing `page*1` instead of `page*2` alone: measured 92% non-finite -> **100%** non-finite (`max |x| 0`). The
+  reversal says the reader is not addressing what I assumed; the write side is not the lever.
+- Changing only the reader's `QsaShapes`: no behavioural change (the counts and offsets were already right).
+
+**What it would give you.** The batched path measured **860-990 tok/s**, i.e. **41-47%** of the layer split's
+2114.8. Beyond that you must attack expert scheduling — **host grouping is 47.8%** of the TP prefill because
+both ranks route the same experts through the same 11-thread CPU pool — not the KV.
+
 ## 5. The evidence chain (all of it measured)
 
 1. **Single-card control, same binary, same prompt.** 3 458 tokens on one card: 3 458 of 3 458 read,

@@ -89,6 +89,45 @@ strata serve: prompt 6856 tokens = 0 reused + 6851 of 6856 read in 7972 ms (859.
 if (o.tp > 0 && std::getenv("STRATA_TP_FASTPROMPT") == nullptr) return true;   // 走窗口
 ```
 
+## 4a. 怎么做到「可用的 1000 tok/s」（方案）
+>
+**前提：达到 1000 不需要新的优化——它已经达到过（860–990，最高一次 1012）。需要的是让它不崩。**
+所以下面的方案全部是"修正确性"，没有一条是"提速"。
+>
+### 快路径与默认路径差在哪
+默认路径把 prompt 拆成 6 个 token 一格的 verify 窗口；快路径用**一次批量 prefill** 处理整个 prompt。
+二者唯一的实质差别是 **KV 怎么写进去**：
+- 批量路径：`kv_append`（预填充内核），一次写 N 个 cell
+- 窗口路径：`kv_append_q8_step`（单 token 内核），每格写 5–6 个 cell
+而 decode 与窗口的**读取只有一种算法**。两条写入逻辑的页行不一致，读取就必然踩空。
+>
+### 为什么现在不能用
+批量写完 N−5 个 token 后，第一次读取（short-read 窗口或首个 decode）拿到的不是那 N 个 cell：
+```
+layer 3  qsa attn  583872 of 635904 non-finite (max |x| 2.288e+06)
+```
+而 `qsa q(in)` 探针干净——**查询是好的，坏在读 KV**。
+>
+### 修复顺序（按成本从低到高）
+1. **对表**（预计一次改动即可定案）：在 `kv_append_kernel` 里打印前 8 个 cell 的 `row_id`，
+   在 `src/kernels/cuda/qsa_prompt_attn.cu` 的 `srow` 填充处打印同 8 个 cell 的 `r`。
+   两者不一致 → 根因确定。
+2. **查 `ident_table`**：`prefill.cpp:1204` 构建它，`staged=1` 时读端（`pools_of(m.stage, m.ident_table)`）
+   用的就是它。确认 `ident[i] == i`，而不是别的排列。
+3. **记住 `page_size == 4`**：block 数 = cells/4；任何按 64 推的结论都要重算（我早前一族推断因此全错）。
+4. 若第 1 步对表**一致**但输出仍坏，则问题在 stage pool 的**填充**（`kv_stage_from_host` 与
+   `kv_append` 的 `stage` 参数写入），而不在行号计算——这条分支我改动过但没有实测收敛。
+>
+### 已知会失败的两条路（别重复）
+- **只改写端页步长**（`page*2` → `page*1`）：实测从 92% 非有限变成 **100%** 非有限（`max|x|=0`）。
+  反向变化说明读端寻址不是我以为的那样，写端不是杠杆。
+- **只改读端 `QsaShapes`**：行为不变（计数与偏移本来就对）。
+>
+### 修好之后能到多少
+批量路径实测 **860–990 tok/s**，即层切分（2114.8 tok/s）的 **41–47%**。这是复制式 MoE 的上限附近：
+两 rank 把同一批专家路由到**同一个 11 线程 CPU pool**，分段计时里 **host grouping 占 47.8%**。
+所以要继续往上，必须动专家调度（或改成按专家 id 切分 + all-to-all 路由），**不是**继续修 KV。
+
 ## 5. 证据链（全部为实测）
 
 1. **单卡对照：同一二进制、同一 prompt。** 单卡 3 458 token：3 458/3 458 读完、生成 40 token、无错误。
