@@ -1,190 +1,37 @@
 > # 这是一个 fork，不是 Strata 本体
 >
-> 它只为一件事存在：交接一个**未完成、不可用**的实验——两张 RTX 3080 上的张量并行（`--tp 2`）。
-> 分支 `tp2-wip` 是 `296b59d2`（引擎 **0.1.44.1**）之上的提交；上游项目在
+> 只为一件事存在：交接一个**未完成、不可用**的实验——两张 RTX 3080 上的张量并行 `--tp 2`。
+> 分支 `tp2-wip` 基于 `296b59d2`（引擎 **0.1.44.1**）；上游项目在
 > [Niko1221/Strata](https://github.com/Niko1221/Strata)。
 >
-> ## 速度（这是本文最重要的一节，请先看）
+> ## 速度（唯一需要记住的一张表）
 >
-> | 路径 | prefill | decode | 状态 |
-> |---|---|---|---|
-> | batched 快路径（`STRATA_TP_FASTPROMPT=1`） | **860–990 tok/s**（最高一次 1012） | — | ❌ 读完 N−5 个 token 后产生非有限 logits，**不可用** |
-> | verify 窗口路径（**默认**） | **37–52 tok/s** | 37–58 tok/s | ✅ 全长度正确 |
-> | 层切分（原版 PP，同机同 pack 同日） | **2114.8 tok/s** | 99.3 tok/s | ✅ 参照基准 |
->
-> 也就是说：**能用的路径约为层切分的 2%，而接近 1000 tok/s 的那条是坏的。**
-> 1000 tok/s 不是一个可以引用的成绩，它是一个"跑到最后 5 个 token 就坏"的中间态。
->
-> ## 能用的部分（实测，prompt 走 verify 窗口）
->
-> | prompt token | 读取 | prefill | decode |
-> |---|---|---|---|
-> | 108 | 108 / 108 | 43.6 tok/s | 37.4 tok/s |
-> | 3 458 | 3 458 / 3 458 | 37.7 tok/s | 45.9 tok/s |
-> | 6 856 | 6 856 / 6 856 | 52.1 tok/s | 58.4 tok/s |
-> | 14 060 | 14 060 / 14 060 | 41.3 tok/s | 43.4 tok/s |
->
-> - 上述长度均无非有限 logits；能完整生成；视觉、MTP、`--kv-resident`、`--spec` 均可用。
-> - 每卡显存 **19 909 / 19 867 MiB（19.44 / 19.40 GB）**，与层切分（19 399 / 19 957 MiB）持平。
->
-
-> ## 两阶段方案：先「可用的 990」，再「追平 PP 的 2900+」
->
-> **前提：达到 1000 不需要新的优化——它已经达到过（860–990，最高一次 1012）。需要的是让它不崩。**
-> 所以下面的方案全部是"修正确性"，没有一条是"提速"。
->
-> ### 快路径与默认路径差在哪
-> 默认路径把 prompt 拆成 6 个 token 一格的 verify 窗口；快路径用**一次批量 prefill** 处理整个 prompt。
-> 二者唯一的实质差别是 **KV 怎么写进去**：
-> - 批量路径：`kv_append`（预填充内核），一次写 N 个 cell
-> - 窗口路径：`kv_append_q8_step`（单 token 内核），每格写 5–6 个 cell
-> 而 decode 与窗口的**读取只有一种算法**。两条写入逻辑的页行不一致，读取就必然踩空。
->
-> ### 为什么现在不能用
-> 批量写完 N−5 个 token 后，第一次读取（short-read 窗口或首个 decode）拿到的不是那 N 个 cell：
-> ```
-> layer 3  qsa attn  583872 of 635904 non-finite (max |x| 2.288e+06)
-> ```
-> 而 `qsa q(in)` 探针干净——**查询是好的，坏在读 KV**。
->
-> ### 修复顺序（按成本从低到高）
-> 1. **对表**（预计一次改动即可定案）：在 `kv_append_kernel` 里打印前 8 个 cell 的 `row_id`，
->    在 `src/kernels/cuda/qsa_prompt_attn.cu` 的 `srow` 填充处打印同 8 个 cell 的 `r`。
->    两者不一致 → 根因确定。
-> 2. **查 `ident_table`**：`prefill.cpp:1204` 构建它，`staged=1` 时读端（`pools_of(m.stage, m.ident_table)`）
->    用的就是它。确认 `ident[i] == i`，而不是别的排列。
-> 3. **记住 `page_size == 4`**：block 数 = cells/4；任何按 64 推的结论都要重算（我早前一族推断因此全错）。
-> 4. 若第 1 步对表**一致**但输出仍坏，则问题在 stage pool 的**填充**（`kv_stage_from_host` 与
->    `kv_append` 的 `stage` 参数写入），而不在行号计算——这条分支我改动过但没有实测收敛。
->
-> ### 已知会失败的两条路（别重复）
-> - **只改写端页步长**（`page*2` → `page*1`）：实测从 92% 非有限变成 **100%** 非有限（`max|x|=0`）。
->   反向变化说明读端寻址不是我以为的那样，写端不是杠杆。
-> - **只改读端 `QsaShapes`**：行为不变（计数与偏移本来就对）。
->
-
-> ### 第二阶段：从 ~990 追到 PP 的 2900+（990 不是终点，只是 34%）
->
-> **参照系说明**：作者实测原版层切分（PP）的 prefill 可上 **2900+ tok/s**；本报告在同一台机器、同一 pack
-> 上按 36 329 token 测到的是 **2 114.8 tok/s**（prompt 长度不同，读数不同，两个数都记在这里）。
-> 单卡跑同一条 3 458-token prompt 是 **397 tok/s**。
->
-> 所以：
-> - **~990 tok/s 只等于一张卡的产出**，第二张卡在 prefill 上几乎没被用上；
-> - 相对 2900 的目标，990 只有 **34%**；
-> - 而相对本报告测到的 2 114.8，990 是 **47%**。
->
-> **为什么只有一张卡的量**：MoE 是复制的。两个 rank 算**同一批专家**，还挤**同一个 11 线程 CPU pool**。
-> 分段计时（6 856 token，GPU 合计 7 161 ms）：
->
-> | 阶段 | 占比 | 是否重复劳动 |
+> | 路径 | prefill | 状态 |
 > |---|---|---|
-> | host grouping | **47.8%** | ✅ 两 rank 完全相同的工作 |
-> | gdn out proj（TP reduce） | **16.2%** | ❌ TP 独有开销（层切分没有） |
-> | qsa proj | 7.4% | 已切分 |
-> | gemm gate/up + down | 6.9% | ✅ 重复 |
-> | gdn（conv + recurrence） | 5.4% | 已切分 |
-> | combine | 4.4% | ✅ 重复 |
-> | qsa attn | 3.3% | 已切分 |
-> | hc read | 4.7% | 已切分 |
-> | 其余（router/gather/dequant/ple/kv） | 约 4% | 混合 |
+> | batched 快路径（`STRATA_TP_FASTPROMPT=1`） | **860–990 tok/s**（峰值 1012） | ❌ 读完 N−5 个 token 后产生非有限 logits，**不可用** |
+> | verify 窗口路径（**默认**） | **37–52 tok/s** | ✅ 全长度正确 |
+> | 层切分（原版 PP） | **2900+**（作者实测）／ 2114.8（本报告 36 329 token） | ✅ 目标 |
+> | 单卡（同一条 3 458-token prompt） | 397 tok/s | — |
 >
-> **约 60% 的 prefill 是重复劳动**，另外还背了 16.2% 的 reduce。
+> **能用的路径只有层切分的约 2%；~990 tok/s 只等于一张卡的产出，第二张卡在 prefill 上几乎没被用上。**
 >
-> **关键算术（诚实结论）**：即使按专家 id 完美切分、把重复的 60% 砍半，时间也只降到约 0.70 倍，
-> 即 **990 → 约 1 400 tok/s（约 1.4 倍）**。要到 **2 900 需要 2.9 倍**，这要求重复劳动几乎归零、
-> 且 16.2% 的 reduce 也被吸收——**在"复制 MoE"这个设计下做不到**。
+> ## 细节全在文档里
 >
-> **所以阶段二不是本补丁的收尾，而是另一次设计选择：**
->
-> 1. **rank 1 复用 rank 0 的分组结果**（低风险，收益最大项）。两 rank 路由到**完全相同**的专家集合，
->    重复跑 host grouping 是纯浪费。理论上能砍掉接近一半的 47.8%。**未实测。**
-> 2. **合并同层两次 reduce**（低风险）。`ssm_out` 与 `attn_output` 各一次，合计 16.2%，可合批或与下一层重叠。
-> 3. **按专家 id 切分 + all-to-all 路由**（高风险，唯一能把重复的 60% 真正减半的做法）。
->    做完大致落在 **1 400–1 800**。
-> 4. **要达到 2 900 同级**，得让"每张卡每 token 的专家工作量"也减半——即真正把专家集合切成两半、
->    每 token 只在自己拥有的专家上计算。这是与层切分并列的第三种并行方式，**不是 TP 的补丁**。
->
-> **一句话**：修 KV 只能把你从 0 带到 990；1、2、3 三条约到 1 400–1 800；
-> **2 900 需要第 4 条，那是重新设计而不是修 bug。**
-
-> ### 修好之后能到多少
-> 批量路径实测 **860–990 tok/s**，即层切分（2114.8 tok/s）的 **41–47%**。这是复制式 MoE 的上限附近：
-> 两 rank 把同一批专家路由到**同一个 11 线程 CPU pool**，分段计时里 **host grouping 占 47.8%**。
-> 所以要继续往上，必须动专家调度（或改成按专家 id 切分 + all-to-all 路由），**不是**继续修 KV。
-
-> ## 不能用的部分
->
-> 快路径超过一个 KV page 就坏：
-> ```
-> strata serve: non-finite logits (#879) in a prompt window at position 6851 (row 0)
-> strata serve: prompt 6856 tokens = 0 reused + 6851 of 6856 read in 7972 ms (859.4 tok/s)
-> ```
-> 因此批量路径被做成 opt-in，**verify 窗口是 TP 的默认**。
->
-> ## 定位到哪一步（证据）
->
-> - **单卡对照**（同一二进制、同一 3 458-token prompt）：单卡 3 458/3 458 正常；双卡 3 453/3 458 后崩。
->   单卡**不存在**"批量写入 → 窗口读取"这条衔接，TP 有。
-> - **强制走窗口**（`STRATA_TP_WINDOWS=1`）：3 458/3 458 正确 → reduce、GDN、MoE、显存都是好的。
-> - **`STRATA_DBG_GDN=1`**（本补丁新增）给出的断面：
->   ```
->   layer 0/1/2  GDN 块        干净
->   layer 3      qsa q(in)     干净            ← 查询本身没问题
->   layer 3      qsa attn      583872/635904 非有限（max |x| 2.288e+06）
->   layer 3      qsa bo(reduce) 527360/529920 非有限
->   layer 4      GDN 块        整块非有限（下游结果）
->   ```
-> - 从运行中的内核打出的配置：`staged=1  kv_mode=1  page_size=4  s.n_head_kv=2`
->   ——**`page_size` 是 4 不是 64**，早前一批基于 64 的推断全部作废，这是 13 次失败的主因之一。
-> - 页步长两个方向都试过并回退：写 `page*2`/读 `page*1` → 92% 非有限；写 `page*1`/读 `page*1` → **100%**
->   非有限。**这个反向变化说明读端寻址不是我以为的那样，写端不是杠杆。**
->
-> ## 顺带挖出的两个真 bug（与 TP 无关，单卡也有价值）
->
-> 1. **QSA 查询步长不一致**：`split_q_kernel` 把 rank 的 query head 按 `qh*256` 紧密排列，
->    `rope`/`rms_rows`/`gate_attn` 也都按 3072 寻址，但两个注意力调用点仍用模型全量的 6144。
-> 2. **专家缓存尺寸**：重试按固定 3/4 缩小，且读的是上下文建立前的空闲值，实际空闲 13.29 GiB 时
->    只分配了 11.46 GiB——白扔 1.83 GiB。改为按 `device_free_bytes()` 填充后，显存才到 19.44 GB。
->
-> ## 为什么还要做：因为 #156
->
-> 上游 [#156](https://github.com/Niko1221/Strata/issues/156) 已于 2026-09-30 以"暂不计划"关闭，
-> 理由是"decode 受专家限制，切 dense 部分收益很小"；基线 `docs/MULTI_GPU.md` 也明说"这是层并行，
-> **不是张量并行**"，基线里 TP 代码为零。**本文不是功能提案，而是 #156 当初缺的那份实测——而数据支持
-> 那个判断**：分段计时显示 **host grouping 占 TP prefill 的 47.8%**（两 rank 的专家挤同一个 CPU pool），
-> TP 的 reduce 再占 **16.2%**。
->
-> ## 没测什么
->
-> 只编了 CUDA（`AGENTS.md` 要求 CUDA+HIP+SYCL）；只有一台机器、一个 pack、一个模型；**没测 50K–100K**
-> （正确路径约 40 tok/s，单次约 20 分钟，我只测到 14 060 token）；**没做质量评估**（只验了 `12*7→84`、
-> token 数完整、无非有限行，没跑召回/困惑度）；**没做单卡逐位回归**；没做长时间稳定性测试。
->
-> ## 接手从哪开始
->
-> 1. 在 `kv_append_kernel` 里打印它对前 8 个 cell 写入 stage 的 `row_id`，
->    与 `prompt_attn_kernel` 对同 8 个 cell 算出的 `r` 逐值对比。
-> 2. dump `m.ident_table`（`prefill.cpp:1204` 构建），确认 `ident[i] == i`。
-> 3. 记住 `page_size == 4`，block 数是 `cells / 4`。
->
-> ## 文档
->
-> - 中文完整版：[/docs/TP2-HANDOVER.zh-CN.md](docs/TP2-HANDOVER.zh-CN.md)
-> - English：[/docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md)
+> - **中文完整版：[docs/TP2-HANDOVER.zh-CN.md](docs/TP2-HANDOVER.zh-CN.md)** — 可复现的实测数据、
+>   完整证据链、13 项已排除假设、两阶段方案（990 → 2900 的算术）、两个真 bug、未测项、接手三步
+> - English: [docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md)
 > - 代码差异：[main...tp2-wip](https://github.com/ZeaMQ/Strata/compare/main...tp2-wip)（39 个文件）
-> - 上游 issue：[#3025](https://github.com/Niko1221/Strata/issues/3025)（本交接，已由我关闭）
+> - 上游 issue：[#3025](https://github.com/Niko1221/Strata/issues/3025)（本交接，已关闭）、
+>   [#156](https://github.com/Niko1221/Strata/issues/156)（当年以"暂不计划"关闭，本交接的实测支持那个判断）
 >
 > **来源：** AI 辅助、跨多次长时间会话完成，**未经人工 review**；快速路径经过 **13 次**独立修复尝试仍未解决。
+> 只编过 CUDA，未验证 HIP / SYCL。
 >
 > ---
 >
-> **This is a fork, not Strata.** It hands over one unfinished, **not usable** experiment: tensor parallel
-> (`--tp 2`) on two RTX 3080s. Branch `tp2-wip`, on top of `296b59d2` (engine 0.1.44.1).
-> **Speeds:** the fast path measures 860–990 tok/s but produces non-finite logits (broken); the path that
-> works runs at 37–52 tok/s, about **2%** of the layer split's 2114.8 tok/s on the same machine.
-> Read [docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md) first. Not human-reviewed; thirteen fix attempts did not
-> resolve the remaining defect.
+> **Fork, not Strata.** An unfinished, **not usable** tensor-parallel (`--tp 2`) experiment on 2x RTX 3080.
+> The path that works runs at 37–52 tok/s — about 2% of the layer split; the ~990 tok/s path produces
+> non-finite logits. Not human-reviewed. Details in [docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md).
 >
 > ---
 >
