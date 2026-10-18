@@ -39,9 +39,18 @@ uint64_t align_up(uint64_t n, uint64_t a) { return (n + a - 1) / a * a; }
 /// The floats one GDN layer's recurrent + conv state needs.  `gdn_buffers_bytes` carves them for ONE layer and
 /// `GdnBuffers::state`/`conv_state` point INTO that carve, so a session with 36 GDN layers has to give each one
 /// its own - they cannot share, because the recurrence is the whole point.
+inline int64_t gdn_v_heads_rank(const ModelGeometry& g) {
+    const int64_t r = (int64_t) strata::core::tp_ranks_current();
+    return r > 0 ? g.ssm_v_heads / r : g.ssm_v_heads;
+}
+inline int64_t gdn_channels_rank(const ModelGeometry& g) {
+    const int64_t r = (int64_t) strata::core::tp_ranks_current();
+    return r > 0 ? g.ssm_conv_channels / r : g.ssm_conv_channels;
+}
+
 uint64_t gdn_state_floats(const ModelGeometry& g) {
-    return (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-           (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    return (uint64_t) g.ssm_state_size * gdn_v_heads_rank(g) * g.ssm_state_size +
+           (uint64_t) gdn_channels_rank(g) * (g.ssm_d_conv - 1);
 }
 
 }  // namespace
@@ -187,7 +196,7 @@ void gdn_point_at(const ModelGeometry& g, int64_t layer, SessionState& s) {
     int64_t gdn_index = 0;
     for (int64_t l = 0; l < layer; ++l) if (!is_qsa_layer(g, l)) ++gdn_index;
     s.gdn.state = s.gdn_state + (size_t) (gdn_index - s.gdn_ord0) * gdn_state_floats(g);
-    s.gdn.conv_state = s.gdn.state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+    s.gdn.conv_state = s.gdn.state + (uint64_t) g.ssm_state_size * gdn_v_heads_rank(g) * g.ssm_state_size;
 }
 
 /// The per-token staging every QSA layer's captured H2D reads FROM.  Must run before each replay: the graphs
@@ -812,7 +821,7 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
         // every layer start from the previous layer's recurrence, which produces a perfectly finite answer.
         if (!is_qsa_layer(g, l)) {
             s.gdn.state = s.gdn_state + (size_t) gdn_index * gdn_state_floats(g);
-            s.gdn.conv_state = s.gdn.state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+            s.gdn.conv_state = s.gdn.state + (uint64_t) g.ssm_state_size * gdn_v_heads_rank(g) * g.ssm_state_size;
             ++gdn_index;
         }
 

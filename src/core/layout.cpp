@@ -42,8 +42,9 @@ bool fail(std::string& err, const LayerView& v, const char* suffix, const char* 
     return false;
 }
 
-bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std::string& err) {
-    const LayerView v(t, layer);
+bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std::string& err,
+               const ShardTable* shard = nullptr) {
+    const LayerView v(t, layer, shard);
     const bool qsa = is_qsa_layer(g, layer);
 
     // ---- the 2-D tensor set, per layer family
@@ -86,8 +87,19 @@ bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std:
             err = "layer " + std::to_string(layer) + ": missing " + v.name(w.suffix);
             return false;
         }
-        if (r->ne0 != w.ne0) return fail(err, v, w.suffix, "ne0", r->ne0, w.ne0);
-        if (r->ne1 != w.ne1) return fail(err, v, w.suffix, "ne1", r->ne1, w.ne1);
+        // The shape this rank SHOULD hold: the full one, or the sharded one when the table cuts this tensor.
+        // Without this, a tensor-parallel load fails every check on every split tensor - the check would be
+        // measuring the model rather than this rank's part of it.
+        int64_t e0 = w.ne0, e1 = w.ne1;
+        if (const ShardSpec* s = v.shard_of(w.suffix)) {
+            std::string why;
+            if (!shard_shape(*s, w.ne0, w.ne1, e0, e1, why)) {
+                err = "layer " + std::to_string(layer) + ": " + v.name(w.suffix) + ": " + why;
+                return false;
+            }
+        }
+        if (r->ne0 != e0) return fail(err, v, w.suffix, "ne0", r->ne0, e0);
+        if (r->ne1 != e1) return fail(err, v, w.suffix, "ne1", r->ne1, e1);
     }
 
     // ---- the 1-D set.  EVERY ONE OF THESE IS `F32` EXCEPT the shared expert's scalar gate, which is BF16 -
@@ -113,7 +125,18 @@ bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std:
             err = "layer " + std::to_string(layer) + ": missing " + v.name(w.suffix);
             return false;
         }
-        if (r->elements != w.elements) return fail(err, v, w.suffix, "elements", r->elements, w.elements);
+        // A 1-D tensor splits on its only axis, so its sharded "shape" is a shorter vector (`ssm_a` is 48 v-head
+        // scalars in the model and 24 on this rank).  The byte-size check below is the FULL one: it compares
+        // the engine form against the weight's kind, and the kind does not change when the vector is cut.
+        int64_t e_elem = w.elements, e_other = 1;
+        if (const ShardSpec* s = v.shard_of(w.suffix)) {
+            std::string why;
+            if (!shard_shape(*s, w.elements, 1, e_elem, e_other, why)) {
+                err = "layer " + std::to_string(layer) + ": " + v.name(w.suffix) + ": " + why;
+                return false;
+            }
+        }
+        if (r->elements != e_elem) return fail(err, v, w.suffix, "elements", r->elements, e_elem);
         if (r->kind != w.kind) {
             // The byte count is what makes this a REAL check and not a label: a 4 B/elem tensor holds
             // `elements * 4`, a 2 B/elem one holds `elements * 2`, and a consumer reading it as the wrong one
@@ -138,18 +161,19 @@ std::string LayerView::name(const char* suffix) const {
     return "blk." + std::to_string(layer_) + "." + suffix;
 }
 
-bool check_layer(const WeightTable& table, const ModelGeometry& g, int64_t layer, std::string& err) {
+bool check_layer(const WeightTable& table, const ModelGeometry& g, int64_t layer, std::string& err,
+                 const ShardTable* shard) {
     if (layer < 0 || layer >= g.n_layers) {
         err = "layer " + std::to_string(layer) + " is outside 0.." + std::to_string(g.n_layers - 1);
         return false;
     }
-    return check_one(table, g, layer, err);
+    return check_one(table, g, layer, err, shard);
 }
 
-bool check_all(const WeightTable& table, const ModelGeometry& g, std::string& err) {
+bool check_all(const WeightTable& table, const ModelGeometry& g, std::string& err, const ShardTable* shard) {
     int64_t n_qsa = 0, n_gdn = 0;
     for (int64_t l = 0; l < g.n_layers; ++l) {
-        if (!check_one(table, g, l, err)) return false;
+        if (!check_one(table, g, l, err, shard)) return false;
         if (is_qsa_layer(g, l)) {
             ++n_qsa;
         } else {

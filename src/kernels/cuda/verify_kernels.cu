@@ -20,6 +20,7 @@
 #include <mutex>
 #include <utility>
 #include <vector>
+#include "strata/core/shard.hpp"   // tp_ranks_current: the GDN split is off for a pair
 
 namespace strata::kernels {
 namespace {
@@ -1068,7 +1069,20 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
     }
-    static const bool split = [] { const char* v = std::getenv("STRATA_GDN_SPLIT"); return v && v[0] == '1'; }();
+    // TENSOR PARALLEL: off by default for a pair.  Measured with the long answer as the judge - with the
+    // split on, a pair produced 'user ask: say hello to the person. user ask: take create annotation chat not
+    // append system do review model nuclear programming challenge...' (a telegraphic word salad); with it off,
+    // 'The user has given me a instruction: "Say: do a message to chat." ... The task involves creating a
+    // image that depicts a specific scene:' - complete sentences.  Turning off the neighbouring GDN kernels
+    // as well made it worse (3 distinct of 8 against 2), so this one is the difference.  The split re-cuts
+    // each head's 128 state columns over four blocks, which is not the geometry a rank owns (24 heads, its
+    // own state block).  One card is unaffected: tp_ranks_current() is 1 there and the split still runs.
+    static const bool split = [] {
+        const char* v = std::getenv("STRATA_GDN_SPLIT");
+        const bool asked = v != nullptr && v[0] == '1';
+        const bool pair = strata::core::tp_ranks_current() > 1;
+        return asked && !pair;
+    }();
     // S26: the split runs where it is faster (gfx1151 harness, h_v 48: the commit 8-19% per call; a window of 2+ rows
     // 3-13%; one row: no gain, the old kernel stays) - bitwise equal in every case
     if (split && (t_out_begin >= n_tok || n_tok - t_out_begin >= 2)) {

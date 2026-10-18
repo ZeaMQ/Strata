@@ -1,6 +1,7 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/batch_rows.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#include "strata/core/tp_runtime.hpp"   // the all-reduce a tensor-parallel rank owes (null on one card)
 #include "strata/core/verify.hpp"
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 #include "strata/core/host_graph_launch.hpp"
@@ -81,6 +82,350 @@ bool window_copy_logits(void* w, int t, float* host);
 #endif
 
 namespace strata::core {
+// THE GDN STATE'S PER-RANK DIMENSIONS.  The tensor-parallel work made the GDN scratch per-rank
+// (`gdn_buffers_bytes`) but left the session state, and every stride into it, on the model's global
+// counts - which agreed with each other and so looked self-consistent while disagreeing with the
+// intent.  Both return the geometry's own values on one card, so the default path is untouched.
+inline int64_t gdn_v_heads_rank(const ModelGeometry& g) {
+    const int64_t r = (int64_t) strata::core::tp_ranks_current();
+    return r > 0 ? g.ssm_v_heads / r : g.ssm_v_heads;
+}
+inline int64_t gdn_channels_rank(const ModelGeometry& g) {
+    const int64_t r = (int64_t) strata::core::tp_ranks_current();
+    return r > 0 ? g.ssm_conv_channels / r : g.ssm_conv_channels;
+}
+
+namespace {
+/// TPDIAG (temporary): see the note at the layer loop in record_window.  The budget covers the first window's
+/// layers and no more, so a serve run prints one block per rank instead of one per token.
+bool tpdiag_layer_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_TP_DIAG_LAYERS"); return v != nullptr && v[0] != '0'; }();
+    return on;
+}
+int g_tpdiag_budget = 256;
+bool g_tpdiag_armed = false;   // set by the first line that carries data (see the layer loop)
+/// TPDIAG's device log: the residual as it leaves each layer, written INSIDE the capture by a device-to-device
+/// copy - the one copy kind a capture allows, where a synchronise fails the whole capture (measured).  It is read
+/// back only after `cudaStreamEndCapture`, so both ranks can be compared layer by layer.
+/// ONE LOG PER RANK: the two ranks run in two threads and both write here, so a single shared buffer
+/// reports whichever rank wrote last, which reads as an intermittent divergence that is not there.
+float* g_tpdiag_log[2] = {nullptr, nullptr};
+
+// DEDICATED PROBE SCRATCH.  An earlier version staged weight bytes into `parts_`, the MoE's own scratch - which
+// `post()` overwrites in the same window, so the dump read garbage.  Measured symptom: a CONSTANT per-layer
+// filter "differed between windows".  This buffer is never touched by the engine.
+float* g_tp_wprobe = nullptr;
+size_t g_tp_wprobe_floats = 0;
+
+void tp_wprobe_reserve(size_t floats) {
+    if (g_tp_wprobe != nullptr && g_tp_wprobe_floats >= floats) return;
+    if (g_tp_wprobe != nullptr) { (void) cudaFree(g_tp_wprobe); g_tp_wprobe = nullptr; g_tp_wprobe_floats = 0; }
+    if (cudaMalloc(&g_tp_wprobe, floats * sizeof(float)) == cudaSuccess) g_tp_wprobe_floats = floats;
+    else { g_tp_wprobe = nullptr; g_tp_wprobe_floats = 0; }
+}
+size_t g_tpdiag_cap[2] = {0, 0};
+
+void tpdiag_log_reserve(size_t dn) {
+    if (!tpdiag_layer_on() || dn == 0) return;
+    const size_t need = dn * (size_t) 560;
+    // BOTH indices: rank 1's `init` runs on the thread that drives rank 0 (`TpRank::build`), so whatever rank
+    // its own thread reports later must already have a log of its own.
+    for (int r = 0; r < 2; ++r) {
+        if (g_tpdiag_log[r] != nullptr && g_tpdiag_cap[r] >= need) continue;
+        if (g_tpdiag_log[r] != nullptr) { (void) cudaFree(g_tpdiag_log[r]); g_tpdiag_log[r] = nullptr; g_tpdiag_cap[r] = 0; }
+        if (cudaMalloc(&g_tpdiag_log[r], need * sizeof(float)) == cudaSuccess) g_tpdiag_cap[r] = need;
+        else { g_tpdiag_log[r] = nullptr; g_tpdiag_cap[r] = 0; }
+    }
+    std::fprintf(stderr, "TPDIAG reserve rank=%d need=%zu MiB log0=%d log1=%d\n",
+                 strata::core::tp_rank_current(), (need * sizeof(float)) >> 20,
+                 g_tpdiag_log[0] != nullptr ? 1 : 0, g_tpdiag_log[1] != nullptr ? 1 : 0);
+}
+
+/// TPDIAG: is the FULL probe set on?  Every record becomes a node in the captured window, and the full set
+/// (about 430 per window) HANGS the GPU stage - measured on two cards: with them on, 587 s and the engine's own
+/// `verify: an earlier window never finished on the GPU (#267)`; with them off, 83 s and a clean run.  So by
+/// default only the slots the current question needs are recorded (the PLE inputs, 556/557) and everything else
+/// needs STRATA_TP_DIAG_FULL=1.
+
+/// TPDIAG: serialise the PLE table's gathers.  `PleTable` is ONE object per process (generate.cpp owns it) and it
+/// carries a row cache, an in-flight slab and an IO worker thread; the two TP ranks call `gather_batch` on it at
+/// the same time with their own buffers.  Same shape as the expert pool and the head: a rank must not share it
+/// with its peer (`kernels/allreduce.hpp`).
+std::mutex& tpdiag_ple_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+bool tpdiag_full_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_TP_DIAG_FULL"); return v != nullptr && v[0] == (char) 49; }();
+    return on;
+}
+
+void tpdiag_pre_record(const float* buf, int64_t l, int grp, int T, int64_t HC, int64_t N, void* cs) {
+    if (!tpdiag_full_on()) return;
+    if (!tpdiag_layer_on() || l < 0 || l >= 48) return;
+    const int rk = strata::core::tp_rank_current() < 2 ? strata::core::tp_rank_current() : 0;
+    if (g_tpdiag_log[rk] == nullptr) return;
+    const size_t dn = (size_t) T * (size_t) HC * (size_t) N;
+    const size_t slot = 96 + (size_t) l * 2 + (size_t) (grp < 2 ? grp : 0);
+    if (dn != 0 && dn * (slot + 1) <= g_tpdiag_cap[rk])
+        (void) cudaMemcpyAsync(g_tpdiag_log[rk] + dn * slot, buf, dn * sizeof(float), cudaMemcpyDeviceToDevice,
+                               (cudaStream_t) cs);
+}
+
+/// The residual ENTERING the layer loop (slot 192): if this already differs between the ranks, the divergence is
+/// upstream of every layer.
+/// A reduce's operand, straight before and straight after the collective (slots 200..203).  The two ranks'
+/// PARTIALS must differ (each holds its own half of the contraction) while their SUMS must agree, so a
+/// disagreement here separates "the collective delivered the wrong thing" from "this rank's own half is wrong".
+void tpdiag_reduce_record(const float* buf, int slot, int64_t n, int64_t stride, void* cs) {
+    if (!tpdiag_layer_on() || n <= 0 || stride <= 0) return;
+    // 200..247 and 260..307 are the pre/post slots of the two reduced contractions (T*N floats each, ~10 KB):
+    // they are cheap and they answer the open question - whether the all-reduce hands BOTH ranks the same sum -
+    // so they stay on with only STRATA_TP_DIAG_LAYERS=1 (a full-probe run often dies of the collective instead).
+    // 200..307 are back behind the full-probe gate: they were verified 48/48 already and cost 14 blocking
+    // reads a window, which is what pushed a run past its timeout.
+    if (slot != 474 && slot != 475 && slot != 476 && slot != 192 && slot != 458) return;   // minimal: projection I/O + GDN input
+    const int rk = strata::core::tp_rank_current() < 2 ? strata::core::tp_rank_current() : 0;
+    if (g_tpdiag_log[rk] == nullptr) return;
+    const size_t off = (size_t) slot * (size_t) stride;
+    if (off + (size_t) n <= g_tpdiag_cap[rk])
+        (void) cudaMemcpyAsync(g_tpdiag_log[rk] + off, buf, (size_t) n * sizeof(float), cudaMemcpyDeviceToDevice,
+                               (cudaStream_t) cs);
+}
+
+/// The hyper-connection read's output (slot 300).  `hc_*` is MIRRORED in the shard table, so this value must be
+/// identical on both ranks: it splits "the rank-local mixer half is wrong" from "the replicated half already is".
+void tpdiag_hc_record(const float* buf, int T, int64_t HC, int64_t N, void* cs, int layer) {
+    // FULL only: 48 of these per window (245 KB D2D each) is what hung the collective in the probe runs.
+    if (!tpdiag_full_on()) return;
+    if (!tpdiag_layer_on()) return;
+    const int rk = strata::core::tp_rank_current() < 2 ? strata::core::tp_rank_current() : 0;
+    if (g_tpdiag_log[rk] == nullptr) return;
+    const size_t dn = (size_t) T * (size_t) HC * (size_t) N;
+    const size_t slot = 420 + (size_t) (layer < 0 ? 0 : (layer >= 48 ? 47 : layer));
+    if (dn != 0 && dn * (slot + 1) <= g_tpdiag_cap[rk])
+        (void) cudaMemcpyAsync(g_tpdiag_log[rk] + dn * slot, buf, dn * sizeof(float), cudaMemcpyDeviceToDevice,
+                               (cudaStream_t) cs);
+}
+
+void tpdiag_input_record(const float* buf, int T, int64_t HC, int64_t N, void* cs) {
+    if (!tpdiag_layer_on()) return;
+    const int rk = strata::core::tp_rank_current() < 2 ? strata::core::tp_rank_current() : 0;
+    if (g_tpdiag_log[rk] == nullptr) return;
+    const size_t dn = (size_t) T * (size_t) HC * (size_t) N;
+    const size_t slot = 192;
+    if (dn != 0 && dn * (slot + 1) <= g_tpdiag_cap[rk])
+        (void) cudaMemcpyAsync(g_tpdiag_log[rk] + dn * slot, buf, dn * sizeof(float), cudaMemcpyDeviceToDevice,
+                               (cudaStream_t) cs);
+}
+
+void tpdiag_log_dump(int T, int64_t HC, int64_t N, const char* tag, int64_t win) {
+    if (!tpdiag_layer_on()) return;
+    const int rk = strata::core::tp_rank_current() < 2 ? strata::core::tp_rank_current() : 0;
+    if (g_tpdiag_log[rk] == nullptr) return;
+    const size_t dn = (size_t) T * (size_t) HC * (size_t) N;
+    if (dn == 0) return;
+    std::vector<float> h(dn);
+    // MINIMAL DUMP (fast): the layer-0 bracket.  Every slot here is recorded with just STRATA_TP_DIAG_LAYERS=1
+    // (the 400..495 range), and the FIRST one whose line differs between the two ranks is where the divergence
+    // enters the window.  All reads are T*N floats except 448/449/462/463 (T*HC*N), 461/469/470 (T*HC),
+    // and 467/468 (the weights, 61440).
+    auto rd = [&](int slot, int64_t n, const char* nm) {
+        const size_t off = (size_t) slot * dn;
+        if (off + (size_t) n > g_tpdiag_cap[rk]) return;
+        if (cudaMemcpy(h.data(), g_tpdiag_log[rk] + off, (size_t) n * sizeof(float),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) return;
+        double s = 0.0, s2 = 0.0;
+        for (int64_t i = 0; i < n; ++i) { const double v = h[(size_t) i]; s += v; s2 += v * v; }
+        if (s == 0.0 && s2 == 0.0) return;   // an unrecorded slot
+        std::fprintf(stderr, "TPDIAG %ss%d_%s win=%lld rank=%d sum=%.9g sumsq=%.9g v0=%.9g\n", tag, slot, nm,
+                     (long long) win, strata::core::tp_rank_current(), s, s2, (double) h[0]);
+    };
+    const int64_t TN = (int64_t) T * N, THC = (int64_t) T * HC, THCN = (int64_t) dn;
+    rd(192, THCN, "input");
+    rd(476, (int64_t) 3072, "yin");
+    rd(458, TN, "mix1");
+    rd(448, THCN, "R_wb");
+    rd(457, TN, "mix_pre1");
+    rd(458, TN, "mix_rd1");
+    rd(449, THCN, "R_rd1");
+    rd(473, TN, "bo_rd1");
+    rd(475, (int64_t) N, "redpre");
+    rd(474, TN, "redout");
+    rd(465, TN, "mix_pre2");
+    rd(466, TN, "mix_rd2");
+    rd(467, 61440, "wd1");
+    rd(468, 61440, "wi1");
+    rd(469, THC, "lo");
+    rd(470, THC, "rs");
+    rd(471, THC, "inj");
+    rd(472, TN, "bo_pre2");
+    rd(460, TN, "bo_moe");
+    rd(461, THC, "inj2");
+    rd(462, THCN, "R_wb_last");
+    rd(463, THCN, "R_upd");
+    rd(455, TN, "mix_router");
+    return;
+    // (the full probe set below is disabled while the minimal dump answers the open question)
+    if (dn * 193 <= g_tpdiag_cap[rk] &&
+        cudaMemcpy(h.data(), g_tpdiag_log[rk] + dn * 192, dn * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
+        double s = 0.0, s2 = 0.0;
+        for (size_t i = 0; i < dn; ++i) { const double v = h[i]; s += v; s2 += v * v; }
+        if (s != 0.0 || s2 != 0.0)
+            std::fprintf(stderr, "TPDIAG %sinput win=%lld rank=%d sum=%.9g sumsq=%.9g v0=%.9g\n", tag, (long long) win,
+                         strata::core::tp_rank_current(), s, s2, (double) h[0]);
+    }
+    // ONE iteration: every record in this probe set fires at layer 0 only, so repeating the loop re-read the same
+    // slots.  Eight blocking reads per window, not fifty-six - the goal's own rule (`>14` stretched a window to
+    // 138005 ms and tripped the engine's #267 watchdog) applies to my instrument as much as to anything else.
+    for (int l2 = 0; l2 < 1; ++l2) {
+        // FOURTEEN copies, not 96 x 7.  Each one is a BLOCKING D2H and they are issued between windows, so the
+        // previous widening (96 slots times the 7 bisection layers = 672 syncs per window per rank) stretched a
+        // window's GPU stage to 138005 ms and tripped the engine's own hang watchdog (`#267`).
+        static const int kBis2[7] = {0, 8, 16, 24, 32, 40, 41};
+        for (int e2 = 0; e2 < 14; ++e2) {
+            const int l2b = kBis2[e2 % 7];
+            const int slot2 = (e2 < 7 ? 200 : 260) + l2b;
+            const size_t off2 = (size_t) slot2 * (size_t) dn;
+            if (off2 + (size_t) N > g_tpdiag_cap[rk]) continue;
+            if (cudaMemcpy(h.data(), g_tpdiag_log[rk] + off2, (size_t) N * sizeof(float),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) continue;
+            double s2v = 0.0, q2v = 0.0;
+            for (int64_t i = 0; i < N; ++i) { const double v = h[(size_t) i]; s2v += v; q2v += v * v; }
+            std::fprintf(stderr, "TPDIAG %s win=%lld rank=%d slot=%d sum=%.9g sumsq=%.9g\n",
+                         (e2 < 4 ? "L_redpre" : "L_redpost"), (long long) win,
+                         strata::core::tp_rank_current(), l2b, s2v, q2v);
+        }
+        const int slots_extra[2] = {556, 557};
+        const int64_t lens_extra[2] = {(int64_t) T * strata::kernels::NG_HC_DIM, (int64_t) T * N};
+        const char* nm_extra[2] = {"L_plekey", "L_pleval"};
+        for (int e = 0; e < 3; ++e) {
+            const size_t off = (size_t) slots_extra[e] * (size_t) (T * HC * N);
+            if (off + (size_t) lens_extra[e] > g_tpdiag_cap[rk]) continue;
+            if (cudaMemcpy(h.data(), g_tpdiag_log[rk] + off, (size_t) lens_extra[e] * sizeof(float),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) continue;
+            double s = 0.0, s2 = 0.0;
+            for (int64_t i = 0; i < lens_extra[e]; ++i) { const double v = h[(size_t) i]; s += v; s2 += v * v; }
+            if (s == 0.0 && s2 == 0.0) continue;
+            std::fprintf(stderr, "TPDIAG %s win=%lld rank=%d sum=%.9g sumsq=%.9g\n", nm_extra[e],
+                         (long long) win, strata::core::tp_rank_current(), s, s2);
+        }
+        static const int kBis[7] = {0, 8, 16, 24, 32, 40, 41};
+        const int bis = kBis[l2 < 7 ? l2 : 6];
+        {
+            static int cap_once[2] = {0, 0};
+            const int cr = strata::core::tp_rank_current();
+            if (cr >= 0 && cr < 2 && cap_once[cr] == 0) {
+                cap_once[cr] = 1;
+                // Each slot's record lands at `slot * T*HC*N` floats; the dump reads the same offset.  A slot
+                // past the capacity is skipped by the record and left stale for the dump - which is exactly the
+                // artefact that would make two ranks "agree" on a value neither of them wrote.
+                std::fprintf(stderr, "TPDIAG cap rank=%d cap=%zu stride=%lld slot482_need=%zu\n", cr,
+                             g_tpdiag_cap[cr], (long long) (int64_t) T * HC * N,
+                             (size_t) 482 * (size_t) ((int64_t) T * HC * N) + 128);
+            }
+        }
+        const int slots[3] = {481, 496, 497};
+        const int64_t lens[3] = {32, 32, 32};
+        const char* nm[3] = {"L_st0", "L_st16384", "L_st393184"};
+        for (int e = 0; e < 3; ++e) {
+            const size_t off = (size_t) slots[e] * (size_t) (T * HC * N);
+            if (off + (size_t) lens[e] > g_tpdiag_cap[rk]) continue;
+            if (cudaMemcpy(h.data(), g_tpdiag_log[rk] + off, (size_t) lens[e] * sizeof(float),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) continue;
+            double s = 0.0, s2 = 0.0;
+            for (int64_t i = 0; i < lens[e]; ++i) { const double v = h[(size_t) i]; s += v; s2 += v * v; }
+            if (s == 0.0 && s2 == 0.0) continue;
+            std::fprintf(stderr, "TPDIAG %s%s win=%lld rank=%d slot=%d sum=%.9g sumsq=%.9g\n", tag, nm[e],
+                         (long long) win, strata::core::tp_rank_current(), l2, s, s2);
+        }
+    }
+    {
+        const struct { int slot; int64_t n; const char* tag; } extra[] = {
+            {303, (int64_t) T * N, "bo_prev"}, {304, (int64_t) T * HC, "rs"},
+            {306, (int64_t) T * HC, "lo"}};
+        for (const auto& e : extra) {
+            const size_t off = (size_t) e.slot * (size_t) (T * HC * N);
+            if (off + (size_t) e.n > g_tpdiag_cap[rk]) continue;
+            if (cudaMemcpy(h.data(), g_tpdiag_log[rk] + off, (size_t) e.n * sizeof(float),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) continue;
+            double s = 0.0, s2 = 0.0;
+            for (int64_t i = 0; i < e.n; ++i) { const double v = h[(size_t) i]; s += v; s2 += v * v; }
+            std::fprintf(stderr, "TPDIAG %s%s win=%lld rank=%d sum=%.9g sumsq=%.9g v0=%.9g\n", tag, e.tag,
+                         (long long) win, strata::core::tp_rank_current(), s, s2, (double) h[0]);
+        }
+    }
+    if (dn * 303 <= g_tpdiag_cap[rk] &&
+        cudaMemcpy(h.data(), g_tpdiag_log[rk] + dn * 302, dn * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
+        double s = 0.0, s2 = 0.0;
+        for (int64_t i = 0; i < (int64_t) T * N; ++i) { const double v = h[(size_t) i]; s += v; s2 += v * v; }
+        if (s != 0.0 || s2 != 0.0)
+            std::fprintf(stderr, "TPDIAG %smixed0 win=%lld rank=%d sum=%.9g sumsq=%.9g v0=%.9g\n", tag,
+                         (long long) win, strata::core::tp_rank_current(), s, s2, (double) h[0]);
+    }
+    if (dn * 302 <= g_tpdiag_cap[rk] &&
+        cudaMemcpy(h.data(), g_tpdiag_log[rk] + dn * 301, dn * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
+        double s = 0.0, s2 = 0.0;
+        for (int64_t i = 0; i < (int64_t) T * N; ++i) { const double v = h[(size_t) i]; s += v; s2 += v * v; }
+        if (s != 0.0 || s2 != 0.0)
+            std::fprintf(stderr, "TPDIAG %smixed win=%lld rank=%d sum=%.9g sumsq=%.9g v0=%.9g\n", tag,
+                         (long long) win, strata::core::tp_rank_current(), s, s2, (double) h[0]);
+    }
+    if (dn * 301 <= g_tpdiag_cap[rk] &&
+        cudaMemcpy(h.data(), g_tpdiag_log[rk] + dn * 300, dn * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
+        double s = 0.0, s2 = 0.0;
+        for (size_t i = 0; i < dn; ++i) { const double v = h[i]; s += v; s2 += v * v; }
+        if (s != 0.0 || s2 != 0.0)
+            std::fprintf(stderr, "TPDIAG %shc win=%lld rank=%d sum=%.9g sumsq=%.9g v0=%.9g\n", tag,
+                         (long long) win, strata::core::tp_rank_current(), s, s2, (double) h[0]);
+    }
+    for (int l2 = 0; l2 < 2; ++l2) {   // TPDIAG: layers 0..1 only (the dump's D2H copies dominate a run)
+        for (int which = 0; which < 2; ++which) {
+            const int rs = (which ? 260 : 200) + l2;
+            const size_t off = (size_t) rs * (size_t) (T * HC * N);
+            if (off + (size_t) N > g_tpdiag_cap[rk]) continue;
+            if (cudaMemcpy(h.data(), g_tpdiag_log[rk] + off, (size_t) N * sizeof(float),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) continue;
+            double s = 0.0, s2 = 0.0;
+            for (int64_t i = 0; i < N; ++i) { const double v = h[(size_t) i]; s += v; s2 += v * v; }
+            if (s == 0.0 && s2 == 0.0) continue;
+            std::fprintf(stderr, "TPDIAG %sred%s win=%lld rank=%d slot=%d sum=%.9g sumsq=%.9g v0=%.9g\n", tag,
+                         which ? "post" : "pre", (long long) win, strata::core::tp_rank_current(), l2, s, s2,
+                         (double) h[0]);
+        }
+    }
+    for (int half = 0; half < 2; ++half)
+    for (int l = 0; l < 2; ++l) {   // TPDIAG: layers 0..1 only; the D2H copies dominate a probe run
+        for (int g = 0; g < 2; ++g) {
+            const size_t slot = (size_t) (half ? 96 : 0) + (size_t) l * 2 + (size_t) g;
+            if (dn * (slot + 1) > g_tpdiag_cap[rk]) continue;
+            if (cudaMemcpy(h.data(), g_tpdiag_log[rk] + dn * slot, dn * sizeof(float),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) continue;
+            double s = 0.0, s2 = 0.0;
+            for (size_t i = 0; i < dn; ++i) { const double v = h[i]; s += v; s2 += v * v; }
+            if (s == 0.0 && s2 == 0.0) continue;
+            std::fprintf(stderr, "TPDIAG %s%s win=%lld rank=%d layer=%d grp=%d sum=%.9g sumsq=%.9g v0=%.9g\n", tag,
+                         half ? "pre" : "post", (long long) win, strata::core::tp_rank_current(), l, g, s, s2, (double) h[0]);
+        }
+    }
+    // TPDIAG: the reduce partial (slot 475) and the full reduced output (slot 474) are recorded by
+    // STRATA_TP_DIAG_LAYERS=1; read them back to see whether the two ranks agree after the collective.
+    for (int which = 0; which < 2; ++which) {
+        const int slot = which ? 474 : 475;
+        const int64_t n = which ? (int64_t) T * N : (int64_t) N;
+        const size_t off = (size_t) slot * dn;
+        if (off + (size_t) n > g_tpdiag_cap[rk]) continue;
+        if (cudaMemcpy(h.data(), g_tpdiag_log[rk] + off, (size_t) n * sizeof(float),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) continue;
+        double s = 0.0, s2 = 0.0;
+        for (int64_t i = 0; i < n; ++i) { const double v = h[(size_t) i]; s += v; s2 += v * v; }
+        std::fprintf(stderr, "TPDIAG %sred%s win=%lld rank=%d sum=%.9g sumsq=%.9g v0=%.9g\n", tag,
+                     which ? "out" : "pre", (long long) win, strata::core::tp_rank_current(), s, s2, (double) h[0]);
+    }
+}
+   // 48 layers x 2 groups x 2 ranks, plus margin
+}
 namespace {
 
 constexpr float EPS = 1e-6f;
@@ -320,7 +665,13 @@ bool mapped(size_t bytes, void** h, void** d) {
         return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
     }
 #endif
-    if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | (peer_portable() ? cudaHostAllocPortable : 0)) != cudaSuccess) return false;   // multi-GPU: portable only with a peer - the peer card writes its rows into them
+    // A TENSOR-PARALLEL RANK NEEDS PORTABLE MAPPINGS TOO, and without the flag the mapping belongs to ONE card -
+// the one current at allocation time.  That is what made rank 1 lose the expert output: the pool writes the
+// HOST pointer `h_ymiss_` and the window reads the DEVICE pointer `m_ymiss_`, which on rank 1 pointed into
+// rank 0's card.  The decision is made HERE rather than through `set_peer_portable`, because that global also
+// means "a layer split is running" to other code.
+    const bool portable = peer_portable() || strata::core::tp_ranks_current() > 1;
+    if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | (portable ? cudaHostAllocPortable : 0)) != cudaSuccess) return false;   // multi-GPU: portable only with a peer - the peer card writes its rows into them
     std::memset(*h, 0, bytes);
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
 }
@@ -616,8 +967,25 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
 
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
-    const uint64_t C = (uint64_t) g.ssm_conv_channels, ZV = (uint64_t) g.ssm_value_dim, HV = (uint64_t) g.ssm_v_heads;
-    const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
+    // TENSOR PARALLEL: the GDN block runs on THIS RANK's head-channels, so every GDN buffer carved below is
+    // narrower.  `tp_heads` with one rank gives the geometry's own numbers, so a single-card run is unchanged -
+    // and these four (`C`, `ZV`, `HV`, `HK`) are the only dimensions involved, because they are GDN-only
+    // (attention uses N/HC/NH/HD/NKV, which are not split).  The same substitution has to be made in the three
+    // places that carve and use these buffers (`init`'s sibling sites in the window, captured and pipelined
+    // paths), and they must all agree: this one SIZES the arena, the others fill it.
+    TpHeads tph;
+    std::string tp_head_err;
+    if (!tp_heads(g, tp_rank_current(), tp_ranks_current(), tph, tp_head_err)) return false;
+    const uint64_t C = (uint64_t) tph.qkv_count(), ZV = (uint64_t) (tph.v_count * tph.head),
+                   HV = (uint64_t) tph.v_count;
+    const uint64_t HK = (uint64_t) tph.q_count;
+    // ... and the ATTENTION heads are split the same way (the shard table cuts `attn_q`/`attn_k`/`attn_v` by
+    // head and `attn_output` by contraction), so a rank's head loops must run over ITS heads.  `HD` does not
+    // change: a head keeps its width, it is the NUMBER of heads that halves.  With one rank both are the
+    // geometry's numbers.
+    const uint64_t tpr = (uint64_t) tp_ranks_current();
+    const uint64_t NH = (uint64_t) g.n_head / tpr, HD = (uint64_t) g.head_dim,
+                   NKV = (uint64_t) g.n_head_kv / tpr;
     const uint64_t IQ = (uint64_t) g.idx_q_heads, ID = (uint64_t) g.idx_key_dim;
     const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers();
     const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
@@ -671,6 +1039,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
         pos_ = b.take<int32_t>(T * (NH + NKV + IQ)); commit_ = b.take<int32_t>(2 + T);
         ple_ = b.take<float>(T * N); emb_ = b.take<float>(T * N); R_ = b.take<float>(T * HC * N);
+    tpdiag_log_reserve((size_t) T * (size_t) HC * (size_t) N);
         mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
         inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
@@ -859,17 +1228,41 @@ const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) 
 // while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
 // state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
 bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+    strata::core::tpdiag_set_window_stream((void*) cs);   // TPDIAG: see the no-MoE bypass
+    // TPDIAG: once, so a run says whether this is even the path the prompt takes, and with what T.
+    if (tpdiag_layer_on()) {
+        static int once = 0;
+        if (once < 400) {   // TPDIAG: no useful limit - the question is which windows EACH rank captured
+            ++once;
+            cudaStreamCaptureStatus cst = cudaStreamCaptureStatusNone;
+            const bool cap = cudaStreamIsCapturing(cs, &cst) == cudaSuccess && cst != cudaStreamCaptureStatusNone;
+            std::fprintf(stderr,
+                         "TPDIAG entry rank=%d T=%d capturing=%d layers=%lld..%lld diag_env=%d "
+                         "split=%d batch_rec=%d G=%d\n",
+                         strata::core::tp_rank_current(), T, (int) cap, (long long) lb_, (long long) le_,
+                         tpdiag_layer_on() ? 1 : 0, split_ ? 1 : 0, batch_rec_ ? 1 : 0,
+                         (split_ && T >= 2 && !batch_rec_) ? 2 : 1);
+        }
+    }
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const WeightTable& wt = *wt_;
     SessionState& ss = *ss_;
-    const int64_t N = g.n_embd, HC = g.hc, K = ss.k, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
-    const int64_t HV = g.ssm_v_heads, HK = g.ssm_k_heads, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
+    const int64_t N = g.n_embd, HC = g.hc, K = ss.k, HD = g.head_dim;
+    // TENSOR PARALLEL: the head COUNT is this rank's (see `init`); `HD` is the same
+    const int64_t tpr = tp_ranks_current();
+    const int64_t NH = g.n_head / tpr, NKV = g.n_head_kv / tpr;
+    // TENSOR PARALLEL: the four GDN dimensions come from this rank's head range, exactly as in `init` - which
+    // sizes the buffers these fill.  The two have to agree; with one rank both are the geometry's numbers.
+    TpHeads tph;
+    std::string tp_head_err;
+    if (!tp_heads(g, tp_rank_current(), tp_ranks_current(), tph, tp_head_err)) return false;
+    const int64_t C = tph.qkv_count(), ZV = tph.v_count * tph.head, HV = tph.v_count, HK = tph.q_count;
     const int64_t IQ = g.idx_q_heads, ID = g.idx_key_dim, NE = g.n_expert, MT = max_t_;
     const QsaShapes s = shapes_of(g);
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
-    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * gdn_v_heads_rank(g) * g.ssm_state_size +
+                                (uint64_t) gdn_channels_rank(g) * (g.ssm_d_conv - 1);
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
     const int64_t TS = (s.idx_block - 1) * ID;
     const bool ple_on = ss.ple.ready() && ple_stage();
@@ -974,6 +1367,35 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto pre = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         stamp(l, 0, grp);
+        {
+            static int once[2] = {0, 0};
+            const int rk_ = strata::core::tp_rank_current() < 2 ? strata::core::tp_rank_current() : 0;
+            if (once[rk_] < 4) { ++once[rk_];
+                std::fprintf(stderr,
+                             "TPDIAG plesess rank=%d l=%lld table=%p key_bf16=%p key_native=%p "
+                             "hist=%p\n",
+                             rk_, (long long) l, (const void*) ss.ple.table, (const void*) ss.ple.w.key_bf16,
+                             (const void*) ss.ple.w.key_native_data, (const void*) ss.ple.hist);
+            }
+        }
+
+        // TPDIAG: the layer's START, before any write below.  The window prologue fills only `R_` (the embedding
+        // broadcast), so this is where `bo_`/`inj2_`/`rs_` show whether they are initialised at all, and whether
+        // the two ranks agree on them before the layer touches them.
+        {
+            const int64_t dn = (int64_t) T * HC * N;
+            const int l32 = l < 0 ? 0 : (l >= 48 ? 47 : (int) l);
+            // BISECTION on R: R at the top of pre(l) is what layer l-1 left.  Measured so far: the two ranks'
+            // residuals already differ by 13% at the top of layer 41 (rank0 320.28 / rank1 279.17) even though
+            // every reduce in layers 0..40 agreed bit for bit - so the divergence is in the replicated part and
+            // grows with depth.  These layers pin the first one it appears at.
+            if (l32 == 0 || l32 == 8 || l32 == 16 || l32 == 24 || l32 == 32 || l32 == 40 || l32 == 41)
+                tpdiag_reduce_record(R_, 400 + l32, dn, dn, cs);                   // per layer: the residual (one meaning)
+            if (l32 <= 2) tpdiag_reduce_record(inj2_, 480 + l32, (int64_t) T * HC, dn, cs);
+            // layers 0..2: bo_ at the top of pre(1) is what layer 0's MoE combine left, which is exactly the value
+            // the five-way bracket needs (the interval it left is post(0)).
+            if (l32 <= 2) tpdiag_reduce_record(bo_, 320 + l32, (int64_t) T * N, dn, cs);
+        }
         const LayerView v(wt, l);
         const char* pfx[2] = {"hc_attn_", "hc_ffn_"};
         const WeightRef *wn[2], *wd[2], *wu[2], *wi[2];
@@ -1007,7 +1429,34 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             PleWeights pw = ss.ple.w;
             const bool nkey = pw.key_native_data != nullptr && pw.key_bf16 == nullptr;
             const bool batched = !ple_batch_kv && ple_batch && n > 1 && (pw.key_bf16 != nullptr || nkey) && ple_native_bf16_enabled();
-            if (ple_batch_kv) {
+            {
+        // PER RANK: a shared `static int once` lets rank 0 eat the whole budget, so rank 1's value never
+        // appears - which silently invalidated several measurements in this session.
+        static int once2[2] = {0, 0};
+        const int rk_p = strata::core::tp_rank_current() < 2 ? strata::core::tp_rank_current() : 0;
+        if (once2[rk_p] < 8) { ++once2[rk_p];
+            std::fprintf(stderr, "TPDIAG pletable rank=%d table=%p\n", rk_p, (const void*) ss.ple.table);
+        }
+    }
+    {
+        static int once_p[2] = {0, 0};
+        const int rk_pp = strata::core::tp_rank_current() < 2 ? strata::core::tp_rank_current() : 0;
+        if (once_p[rk_pp] < 4) { ++once_p[rk_pp];
+            uint64_t he = 0;
+            const float* hp = (const float*) h_ple_;
+            for (int64_t i = 0; i < (int64_t) T * g_->n_embd && hp != nullptr; ++i) {
+                uint32_t b; std::memcpy(&b, &hp[i], 4); he = he * 1099511628211ull + b;
+            }
+            uint64_t rh = 0;
+            const uint32_t* rp = pl_ple_rows_.empty() ? nullptr : pl_ple_rows_.data();
+            for (int64_t i = 0; i < (int64_t) T * strata::kernels::PLE_N_HEADS && rp != nullptr; ++i)
+                rh = rh * 1315423911ull + rp[i];
+            std::fprintf(stderr, "TPDIAG pleread rank=%d l=%lld T=%d rows=%p hash=%016llx hple=%p emb=%016llx\n",
+                         rk_pp, (long long) l, T, (const void*) rp, (unsigned long long) rh,
+                         (const void*) hp, (unsigned long long) he);
+        }
+    }
+    if (ple_batch_kv) {
                 try {
                     bf16_gemv_fp32_mmvf_multi(ple_ + (size_t) tb * N, N, ss.ple.w.key_bf16,
                                               xn_ + (size_t) tb * HC * N, HC * N, N, HC * N, n, cs);
@@ -1044,6 +1493,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const bool ple_post = ple_batch_kv && ple_post_env && !batch_rec_;
             // #783 PR-g (stuchapin909): the window's residual writes in one launch (STRATA_NO_MULTI_GR=1: per token)
             const bool multi_write = !ple_post && dec_batch && !g_no_multi_gr && n > 1;
+            {
+                static int once = 0;
+                if (once < 24) { ++once;
+                    static int per[2] = {0,0};
+                    const int rr = strata::core::tp_rank_current() < 2 ? strata::core::tp_rank_current() : 0;
+                    if (per[rr] < 4) { ++per[rr];
+                        std::fprintf(stderr, "TPDIAG branch rank=%d l=%lld grp=%d T=%d G=%d n=%d multi=%d ple_post=%d dec_batch=%d g_no_multi=%d\n",
+                                     rr, (long long) l, grp, T, G, n, (int) multi_write, (int) ple_post,
+                                     (int) dec_batch, (int) g_no_multi_gr);
+                    }
+                }
+            }
             if (multi_write) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
             if (ple_post) {
                 float* qn = parts_ + (size_t) tb * K * N;           // n x 10240 (K * N = 25600 per row)
@@ -1106,7 +1567,37 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
-        const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
+        // TPDIAG: the hc read's INPUTS, recorded before the read.  The read's output already differs between the
+        // ranks (slot 300), so one of these four is where the divergence enters.
+        {
+            const int64_t dn = (int64_t) T * HC * N;
+            tpdiag_reduce_record(bo_, 303, (int64_t) T * N, dn, cs);          // the previous block's output
+            tpdiag_reduce_record(rs_, 304, (int64_t) T * HC, dn, cs);         // the residual scale
+            tpdiag_reduce_record(lo_, 306, (int64_t) T * HC, dn, cs);         // the low-rank coefficient (first T*HC of T*hc_lr)
+        }
+        // TPDIAG: R AFTER the whole write-back block and BEFORE the hyper-connection read.  Placed here on
+        // purpose: the write-back has two branches (`gr_write_multi` and the per-token loop) and a record put
+        // after its `if` line is taken at different moments on two ranks that take different branches - which is
+        // what made an earlier round's comparison invalid.
+        // layer 0 only, and on an exempt slot, so this runs with just STRATA_TP_DIAG_LAYERS=1
+        if (l == 0) tpdiag_reduce_record(R_, 448, (int64_t) T * HC * N, (int64_t) T * HC * N, cs);
+        tpdiag_reduce_record(inj2_, 528 + (l < 0 ? 0 : (l >= 48 ? 47 : (int) l)), (int64_t) T * HC,
+                             (int64_t) T * HC * N, cs);
+        // TPDIAG: the PLE's per-token inputs.  The block that diverges is `gr_write_multi` + the PLE's per-token
+        // op, and the PLE is the only part of it with per-rank state, so its inputs are what to compare.
+        if (l == 0) {   // TPDIAG: the PLE's per-token inputs, LAYER 0 ONLY - a record per layer put 48x the
+                         // nodes in the captured window and that is what hung it (measured: 587 s and the
+                         // engine's #267 watchdog, against 83 s and a clean run with the probes off).
+            const int64_t dn_here = (int64_t) T * HC * N;
+            tpdiag_reduce_record(ple_key_, 556, (int64_t) T * strata::kernels::NG_HC_DIM, dn_here, cs);
+            tpdiag_reduce_record(ple_val_, 557, (int64_t) T * N, dn_here, cs);
+        }
+        if (l == 0) tpdiag_reduce_record(mixed_, 457, (int64_t) T * N, (int64_t) T * HC * N, cs);
+        const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);
+        if (l == 0) tpdiag_reduce_record(mixed_, 458, (int64_t) T * N, (int64_t) T * HC * N, cs);
+        if (l == 0) tpdiag_reduce_record(bo_, 473, (int64_t) T * N, (int64_t) T * HC * N, cs);
+        if (l == 0) tpdiag_reduce_record(R_, 449, (int64_t) T * HC * N, (int64_t) T * HC * N, cs);
+        tpdiag_reduce_record(mixed_, 301, (int64_t) T * N, (int64_t) T * HC * N, cs);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
         {   // measurement only: STRATA_DUMMY_NODES=k adds k empty kernel nodes per layer (what one node costs in a window)
             static const int dummy = [] { const char* e = std::getenv("STRATA_DUMMY_NODES"); return e != nullptr ? std::atoi(e) : 0; }();
             for (int d = 0; d < dummy; ++d) gpu_noop(cs);
@@ -1118,15 +1609,50 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 1, grp);
         float* xm = mixed_ + tb * N;
         bool il_ready = false;   // xil_ holds xq_'s interleaved copy (reset whenever xq_ is rewritten)
-        auto mm = [&](const WeightRef* w, float* out, int n_in, int n_out) {
-            if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out)) {
+        // TENSOR PARALLEL, output axis.  A rank holds rows [begin, begin + count) of the full output axis, and
+        // the loader already stored that count in `w->ne1` - so the kernel is told the SHARDED extent and writes
+        // at this rank's offset, with no hot-kernel change at all.  `suffix` is how the split is looked up, and
+        // it is what keeps the GDN `q|k|v` honest: `attn_qkv` is THREE ranges rather than one, `shard_slice`
+        // refuses that, and this call then stays the unsharded one - because a single offset cannot place three
+        // pieces, and guessing would write the v block over the q block.
+        //
+        // With no plan, or for a tensor this rank holds whole, the slice is (0, n_out) and nothing changes.
+        //
+        // The CONTRACTION axis is not this lambda's business: there the output stays full width and the caller
+        // offsets the activation and reduces afterwards (`TpRuntime`).
+        auto mm = [&](const WeightRef* w, float* out, int n_in, int n_out, const char* suffix = nullptr,
+                      int64_t k_begin = 0) {
+            if (suffix != nullptr) {
+                int64_t begin = 0, count = n_out;
+                if (!v.out_slice(suffix, n_out, begin, count)) {
+                    begin = 0;
+                    count = n_out;
+                } else {
+                    out += begin;
+                    n_out = (int) count;
+                }
+            }
+            // TENSOR PARALLEL, contraction axis.  This rank holds columns [k_begin, k_begin + n_in) of the
+            // weight, so the ACTIVATION has to be handed over at the same column - and it is a Q8_1 block array,
+            // where `native_q8_1_bytes(k_begin)` is exactly the byte offset of block `k_begin / 32`: it counts
+            // the same fixed part the base pointer already points past, so this needs no block-size constant and
+            // cannot drift from the layout `native_quantize_q8_1` wrote.  The caller passes the rank's width as
+            // `n_in` and reduces the partial sum afterwards (`TpRuntime`).
+            //
+            // The INTERLEAVED variant is skipped when a column offset is in play: `xil_` is built from the FULL
+            // activation for the multi-column path (`native_q8_1_interleave(xq_, ...)` above), and a rank's slice
+            // of it would need the interleave to be told the same offset.  The plain kernel is what the
+            // single-column decode already uses, so this costs nothing where it matters.
+            const uint8_t* x = xq_;
+            if (k_begin > 0) x += (size_t) strata::kernels::native_q8_1_bytes((int) k_begin);
+            if (k_begin == 0 && g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out)) {
                 if (!il_ready && n >= 2) {   // one column reads the plain q8_1 blocks
                     strata::kernels::native_q8_1_interleave(xq_, xil_, n_in, n, cs);
                     il_ready = true;
                 }
                 strata::kernels::native_mmvq_il(w->native_type, w->native_data, xq_, xil_, out, n_in, n_out, n, cs);
             } else {
-                native_mmvq(w->native_type, w->native_data, xq_, out, n_in, n_out, n, cs);
+                native_mmvq(w->native_type, w->native_data, x, out, n_in, n_out, n, cs);
             }
         };
         try {
@@ -1143,7 +1669,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     return false;
                 const int64_t gi = gdn_idx[(size_t) l];
                 float* state = ss.gdn_state + (size_t) (gi - ss.gdn_ord0) * gdn_floats;
-                float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                float* conv = state + (uint64_t) g.ssm_state_size * gdn_v_heads_rank(g) * g.ssm_state_size;
                 float* qkv = qkv_L_ + (size_t) gi * MT * C;
                 float* hb = h_L_ + (size_t) gi * MT * C;
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
@@ -1155,7 +1681,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                  (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
                                  (int) HV, n, df_side_[0]);
                     fork(1);
-                    native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
+                    // the pipelined side's own `attn_gate` emission, for the same reason the `attn_q` one
+                    // above is written out separately: this path does not go through `mm`
+                    float* gate_out = z_ + (size_t) tb * ZV;
+                    int64_t g_at = 0, g_n = ZV;
+                    if (v.out_slice("attn_gate.weight", ZV, g_at, g_n)) gate_out += g_at;
+                    else g_n = ZV;
+                    native_mmvq(wg->native_type, wg->native_data, xq_, gate_out, (int) N, (int) g_n, n,
                                 df_side_[1]);
                 }
                 const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_;
@@ -1167,7 +1699,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         while (t < te && brow_[t] == brow_[first]) ++t;
                         SessionState& sx = slot_ss(first);
                         const float* cx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
-                                          (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                                          (uint64_t) g.ssm_state_size * gdn_v_heads_rank(g) * g.ssm_state_size;
                         gdn_conv_l2_multi(cx, qkv + (size_t) first * C, (const float*) wc->data,
                                           hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0);
                     }
@@ -1179,8 +1711,62 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
                                       (int) HV, cs);
                 else
+                if (l == 0) {
+                    // TPDIAG: the conv history's CONTENT - channel-aligned, so channel c here is channel c on
+                    // one card even though the per-token stride differs.
+                    // the engine's own history address expression: `state` plus the recurrence state's bytes
+                    const float* hist_p = state + (uint64_t) g.ssm_state_size * gdn_v_heads_rank(g) * g.ssm_state_size;
+                    tpdiag_reduce_record(hist_p, 493, 1024, (int64_t) T * HC * N, cs);
+                }
+                {
+                    // BOUND CHECK, host-side and free: does the history offset this rank uses fit inside the
+                    // block the rank's own allocation sized?  Printed once per rank so the global-vs-per-rank
+                    // head count in that offset is decided by a number rather than by an 8-sample guess.
+                    static int hx_once2[2] = {0, 0};
+                    const int hx_r = strata::core::tp_rank_current();
+                    if (hx_r >= 0 && hx_r < 2 && hx_once2[hx_r] == 0) {
+                        hx_once2[hx_r] = 1;
+                        const int64_t ss = g.ssm_state_size;
+                        const uint64_t rec_g = (uint64_t) ss * (uint64_t) g.ssm_v_heads * (uint64_t) ss;
+                        const uint64_t rec_r = (uint64_t) ss * (uint64_t) tph.v_count * (uint64_t) ss;
+                        const uint64_t hist_b = (uint64_t) C * (uint64_t) (g.ssm_d_conv - 1) * 4;
+                        std::fprintf(stderr,
+                                     "TPDIAG hist rank=%d gdn_floats=%lld ss=%lld hv_global=%lld hv_rank=%lld "
+                                     "C=%lld d_conv=%lld rec_global=%llu rec_rank=%llu hist_bytes=%llu "
+                                     "block_g=%llu block_r=%llu\n",
+                                     hx_r, (long long) gdn_floats, (long long) ss, (long long) g.ssm_v_heads,
+                                     (long long) tph.v_count, (long long) C, (long long) g.ssm_d_conv,
+                                     (unsigned long long) rec_g, (unsigned long long) rec_r,
+                                     (unsigned long long) hist_b,
+                                     (unsigned long long) (rec_g + hist_b),
+                                     (unsigned long long) (rec_r + hist_b));
+                    }
+                }
                 gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb,
                                   self_commit);
+                // TPDIAG: the qkv projection's output and the conv's output, right after both are written.
+                // `qkv`/`conv` are per-rank buffers, so a 3072-float prefix is rank 0's q[0,8)|k[0,8)|v[0,24)
+                // segment - the single card's first 3072 when the split is the prefix it claims to be.
+                if (l == 0) {
+                    tpdiag_reduce_record(qkv, 479, 3072, (int64_t) T * HC * N, cs);
+                    tpdiag_reduce_record(conv, 480, 3072, (int64_t) T * HC * N, cs);
+                }
+                {
+                    // TPDIAG: are these really two ranks' own buffers?  If any address matches across ranks the
+                    // recurrence is reading the same bytes on both, which is what would make head 0's state
+                    // identical while `y_` still differs (each rank writes its own `ZV`-wide output).
+                    static int bufs_once[2] = {0, 0};
+                    const int br_ = strata::core::tp_rank_current();
+                    if (br_ >= 0 && br_ < 2 && bufs_once[br_] == 0) {
+                        bufs_once[br_] = 1;
+                        std::fprintf(stderr,
+                                     "TPDIAG bufs rank=%d qkv=%p conv=%p hb=%p gate=%p beta=%p z=%p y=%p "
+                                     "state=%p\n",
+                                     br_, (const void*) qkv, (const void*) conv, (const void*) hb,
+                                     (const void*) gate, (const void*) beta, (const void*) z_,
+                                     (const void*) y_, (const void*) state);
+                    }
+                }
                 stamp(l, 3, grp);
                 if (br) {   // gate, beta and z, before the recurrence reads them
                     join(0);
@@ -1191,7 +1777,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
-                mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV, "attn_gate.weight");
                 stamp(l, 5, grp);
                 }
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
@@ -1207,14 +1793,147 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                             (int) HK, (int) HV, t - first, nullptr, cs, 0);
                     }
                 } else
+                if (l == 0 && parts_ != nullptr) {
+                    // TPDIAG: stage each weight's first bytes on the DEVICE (a legal captured H2D node) and
+                    // record from there.  `parts_` holds T*K*N floats and the MoE only writes it in `post`.
+                    const int wprefix = 64;   // 64 halves / floats per tensor
+                    int at = 0;
+                    if (wa != nullptr && wa->data != nullptr)
+                        (void) cudaMemcpyAsync(parts_ + at, wa->data, (size_t) wprefix * 2,
+                                               cudaMemcpyHostToDevice, cs);
+                    at += wprefix;
+                    if (wb != nullptr && wb->data != nullptr)
+                        (void) cudaMemcpyAsync(parts_ + at, wb->data, (size_t) wprefix * 2,
+                                               cudaMemcpyHostToDevice, cs);
+                    at += wprefix;
+                    if (wsa != nullptr && wsa->data != nullptr)
+                        (void) cudaMemcpyAsync(parts_ + at, wsa->data, (size_t) 24 * 4,
+                                               cudaMemcpyHostToDevice, cs);
+                    at += 24;
+                    if (wdt != nullptr && wdt->data != nullptr)
+                        (void) cudaMemcpyAsync(parts_ + at, wdt->data, (size_t) 24 * 4,
+                                               cudaMemcpyHostToDevice, cs);
+                    at += 24;
+                    tpdiag_reduce_record(parts_, 486, at, (int64_t) T * HC * N, cs);
+                }
+                if (l == 0) {
+                    static int wsh_once[4] = {0, 0, 0, 0};
+                    const int wr2 = strata::core::tp_rank_current();
+                    if (wr2 >= 0 && wr2 < 4 && wsh_once[wr2] == 0) {
+                        wsh_once[wr2] = 1;
+                        std::fprintf(stderr,
+                                     "TPDIAG wshape rank=%d alpha=(%lld,%lld) beta=(%lld,%lld) "
+                                     "a=(%lld,%lld) dt=(%lld,%lld) N=%lld HV=%lld\n",
+                                     wr2, (long long) wa->ne0, (long long) wa->ne1,
+                                     (long long) wb->ne0, (long long) wb->ne1,
+                                     (long long) wsa->ne0, (long long) wsa->ne1,
+                                     (long long) wdt->ne0, (long long) wdt->ne1,
+                                     (long long) N, (long long) HV);
+                    }
+                    // 24 floats, not 128: the stride is `h_v`, so this is token 0's heads 0..23 on the
+                    // pair AND on one card (whose stride is 48) - a fixed wider prefix would span different
+                    // tokens on the two runs and compare nothing.
+                    // CHANNEL-aligned: the conv is depthwise, so channel c is channel c in both runs even
+                    // though the per-token stride differs (C=3072 here, 6144 on one card).
+                    // 1024, not 3072: channel 1024 means q-head 8 on one card and k-head 0 on a rank, so only
+                    // q-heads 0..7 (channels 0..1023) are the same channels in both runs.
+                    tpdiag_reduce_record(hb, 487, 1024, (int64_t) T * HC * N, cs);
+                    // qkv's comparable part: q-heads 0..7 are the same CHANNELS in both runs.
+                    tpdiag_reduce_record(qkv, 488, 1024, (int64_t) T * HC * N, cs);
+                    // the conv filter, staged on the device first (it is a host pointer).
+                    // The probe's own log is a dedicated allocation nothing else writes, so a high slot
+                    // region of it is safe staging space - unlike `parts_`, which the MoE overwrites in the
+                    // same window (that mistake made a CONSTANT filter look window-dependent).
+                    {
+                        const int64_t stride_ = (int64_t) T * HC * N;
+                        const int pr_ = strata::core::tp_rank_current();
+                        if (pr_ >= 0 && pr_ < 2 && g_tpdiag_log[pr_] != nullptr &&
+                            g_tpdiag_cap[pr_] > (size_t) (495 * stride_ + 256)) {
+                            float* stage_ = g_tpdiag_log[pr_] + (size_t) 494 * (size_t) stride_;
+                            if (wc != nullptr && wc->data != nullptr) {
+                                (void) cudaMemcpyAsync(stage_, wc->data, (size_t) 128 * 2,
+                                                       cudaMemcpyHostToDevice, cs);
+                                tpdiag_reduce_record(stage_, 491, 128, stride_, cs);
+                            }
+                            if (wa != nullptr && wa->data != nullptr) {
+                                (void) cudaMemcpyAsync(stage_ + 256, wa->data, (size_t) 64 * 2,
+                                                       cudaMemcpyHostToDevice, cs);
+                                tpdiag_reduce_record(stage_ + 256, 492, 64, stride_, cs);
+                            }
+                        }
+                    }
+                    tpdiag_reduce_record(gate, 483, 24, (int64_t) T * HC * N, cs);
+                    tpdiag_reduce_record(beta, 484, 24, (int64_t) T * HC * N, cs);
+                    tpdiag_reduce_record(z_, 485, 3072, (int64_t) T * HC * N, cs);
+                }
+                if (l == 0) {
+                    static int stptr_once[4] = {0, 0, 0, 0};
+                    const int sr = strata::core::tp_rank_current();
+                    if (sr >= 0 && sr < 4 && stptr_once[sr] == 0) {
+                        stptr_once[sr] = 1;
+                        std::fprintf(stderr,
+                                     "TPDIAG stptr rank=%d state=%p ss.gdn_state=%p ss=%p gdn_floats=%lld\n", sr,
+                                     (const void*) state, (const void*) ss.gdn_state, (const void*) &ss,
+                                     (long long) gdn_floats);
+                    }
+                    tpdiag_reduce_record(state, 482, 128, (int64_t) T * HC * N, cs);
+                }
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
                                     (int) HV, te, self_commit ? one_ : nullptr, cs, tb, g_qfuse() ? (void*) xq_ : nullptr);
+                if (l == 0) {
+                    // TPDIAG: the recurrence state's head-0 row (128 floats) and the first 256, the one
+                    // input to the recurrence never shown to match the single card.  `fused_gdn.cu:75` is
+                    // `state + h*S + j` with "(S, h_v, S) with j fastest", so this is head 0 on both runs.
+                    tpdiag_reduce_record(state, 481, 32, (int64_t) T * HC * N, cs);
+                    tpdiag_reduce_record(state + 16384, 496, 32, (int64_t) T * HC * N, cs);
+                    tpdiag_reduce_record(state + 393184, 497, 32, (int64_t) T * HC * N, cs);
+                    // a SECOND offset: head 0 identical + this one different would mean head 0 is a special
+                    // (shared/global) slot; both identical would mean the whole state is shared.
+                    tpdiag_reduce_record(state + 128, 495, 128, (int64_t) T * HC * N, cs);
+                    tpdiag_reduce_record(state, 494, 256, (int64_t) T * HC * N, cs);
+                }
                 stamp(l, 6, grp);
                 // STRATA_QFUSE: done above by gdn_step_norm_multi - but a batch's per-slot recurrence passes it no q8_1
                 // destination (#1139: the out-projection read stale bytes), so that case quantizes here as without it
                 if (!g_qfuse() || batch_rec_) native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
                 il_ready = false;
+                if (l == 0) {
+                    static int tpgeom_once[4] = {0, 0, 0, 0};
+                    const int rr = strata::core::tp_rank_current();
+                    if (rr >= 0 && rr < 4 && tpgeom_once[rr] == 0) {
+                        tpgeom_once[rr] = 1;
+                        std::fprintf(stderr,
+                                     "TPDIAG geom rank=%d ZV=%lld tph.v_count=%lld tph.head=%lld "
+                                     "wout.ne0=%lld wout.ne1=%lld ranks=%d\n",
+                                     rr, (long long) ZV, (long long) tph.v_count, (long long) tph.head,
+                                     (long long) (wout != nullptr ? wout->ne0 : -1),
+                                     (long long) (wout != nullptr ? wout->ne1 : -1),
+                                     strata::core::tp_ranks_current());
+                    }
+                }
+                // TPDIAG: the projection's INPUT, before `mm` quantises it.  Rank 0's 3072 floats are
+                // heads 0..23 and the single card's first 3072 are the same heads, so this says whether the
+                // recurrence agrees or whether only the quantisation path differs.
+                if (l == 0) tpdiag_reduce_record(y_, 476, 3072, (int64_t) T * HC * N, cs);
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+                // TPDIAG: the reduce's OUTPUT, unconditionally (so the single card records it too and the two
+                // can be compared directly).  On one card there is no reduce, so slot 474 holds `mm`'s full
+                // contraction - exactly what the two ranks' reduced sum must reproduce.
+                if (l == 0) tpdiag_reduce_record(bo_, 474, (int64_t) T * N, (int64_t) T * HC * N, cs);
+                // TENSOR PARALLEL, contraction axis: `ssm_out` contracts over the v heads, and this rank holds
+                // its OWN 24 of them (the recurrence above stepped only those).  The projection is therefore a
+                // PARTIAL sum - the peer's half is added here, before the next layer reads `bo_`.  On one card
+                // `TpRuntime::current()` is null and nothing happens.
+                if (strata::core::TpRuntime* tp = strata::core::TpRuntime::current()) {
+                    tpdiag_reduce_record(bo_ + tb * N, 475, N, (int64_t) T * HC * N, cs);
+                    // THE WHOLE GROUP.  `mm` above wrote `n` rows and reducing only `N` of them left rows tb+1..te-1
+                    // as this rank's partial sum - which is exactly what the layer-0 measurements showed (`bo_`
+                    // differing by a few percent in a stable pattern while the residuals upstream agreed).
+                    if (!tp->reduce(bo_ + tb * N, (int64_t) n * N, cs, err)) return false;
+                    tpdiag_reduce_record(bo_ + tb * N, 260 + (int) l, N, (int64_t) T * HC * N, cs);
+                    if (l == 0) tpdiag_reduce_record(bo_, 474, (int64_t) T * N, (int64_t) T * HC * N, cs);
+                }
+                if (l == 0) tpdiag_reduce_record(R_, 450, (int64_t) T * HC * N, (int64_t) T * HC * N, cs);
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -1262,8 +1981,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool qbr = br && qb;
                 if (qbr) {
                     fork(0);
-                    native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
-                                (int) (NH * 2 * HD), n, df_side_[0]);
+                    // TENSOR PARALLEL: this is the pipelined path's own emission and it does NOT go through
+                    // `mm`, so the output-axis slice has to be applied here too.  Missing one of the two paths
+                    // would leave a rank reading the peer's rows on whichever path the config happens to take
+                    // (`--pipeline-windows` selects this one, and it is on by default for two AMD stages).
+                    float* q_out = qfull_ + tb * NH * 2 * HD;
+                    int64_t q_at = 0, q_n = NH * 2 * HD;
+                    if (v.out_slice("attn_q.weight", NH * 2 * HD, q_at, q_n)) q_out += q_at;
+                    else q_n = NH * 2 * HD;
+                    native_mmvq(wq->native_type, wq->native_data, xq_, q_out, (int) N,
+                                (int) q_n, n, df_side_[0]);
                     copy_rows_strided(qcur_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, (int64_t) n * NH, HD, 2 * HD,
                                       df_side_[0]);
                     norm_rope_on(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH, df_side_[0]);
@@ -1277,8 +2004,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 else for (int t = tb; t < te; ++t)
                     bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
                 stamp(l, 7, grp);
-                mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
-                mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), "attn_k.weight");
+                mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), "attn_v.weight");
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
@@ -1360,7 +2087,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (qbr) {
                     join(1);   // the indexer query, for the block scores
                 } else {
-                mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
+                mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD), "attn_q.weight");
                 if (qb) {
                     if (fuse_nr) {   // the q/gate split reads q straight out of the q|gate rows (stride 2 * HD)
                         native_qsa_rms_norm_rope(qfull_ + tb * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data,
@@ -1441,14 +2168,40 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 14, grp);
                 native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
                 il_ready = false;
+                // TENSOR PARALLEL, contraction axis.  `attn_output` contracts over the head width, and this
+                // rank's activation `attn32_` already holds ITS OWN heads (the buffers are per-rank), so the
+                // projection reads `xq_` at offset 0 with the rank's width - no column offset, no `k_slice`.
+                // Its result is a PARTIAL sum: the peer's half is added before the next layer reads `bo_`.
                 mm(wo, bo_ + tb * N, (int) (NH * HD), (int) N);
+                if (strata::core::TpRuntime* tp = strata::core::TpRuntime::current()) {
+                    tpdiag_reduce_record(bo_ + tb * N, 202, N, (int64_t) T * HC * N, cs);
+                    // THE WHOLE GROUP.  `mm` above wrote `n` rows and reducing only `N` of them left rows tb+1..te-1
+                    // as this rank's partial sum - which is exactly what the layer-0 measurements showed (`bo_`
+                    // differing by a few percent in a stable pattern while the residuals upstream agreed).
+                    if (!tp->reduce(bo_ + tb * N, (int64_t) n * N, cs, err)) return false;
+                    tpdiag_reduce_record(bo_ + tb * N, 203, N, (int64_t) T * HC * N, cs);
+                }
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
             return false;
         }
         stamp(l, 16, grp);
-        const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
+        // The SECOND hyper-connection read (half 1) is the one whose output already differs: the first read's
+        // mixed_ is bit-identical (slot 458), this one's is not (slot 455).  Bracket it: before and after.
+        if (l == 0) tpdiag_reduce_record(mixed_, 465, (int64_t) T * N, (int64_t) T * HC * N, cs);
+        if (l == 0) {
+            tpdiag_reduce_record((const float*) wd[1]->data, 467, 61440, (int64_t) T * HC * N, cs);
+            tpdiag_reduce_record((const float*) wi[1]->data, 468, 61440, (int64_t) T * HC * N, cs);
+        }
+        if (l == 0) {
+            tpdiag_reduce_record(lo_, 469, (int64_t) T * g.hc_lr, (int64_t) T * HC * N, cs);   // the first read's
+            tpdiag_reduce_record(rs_, 470, (int64_t) T * HC, (int64_t) T * HC * N, cs);        // auxiliary outputs
+            tpdiag_reduce_record(inj_, 471, (int64_t) T * HC, (int64_t) T * HC * N, cs);
+            tpdiag_reduce_record(bo_, 472, (int64_t) T * N, (int64_t) T * HC * N, cs);
+        }
+        const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);
+        if (l == 0) tpdiag_reduce_record(mixed_, 466, (int64_t) T * N, (int64_t) T * HC * N, cs);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
         stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
         // competes with it for the GPU's first microseconds); STRATA_SH_FORK_LATE=0 forks at the top as before
@@ -1465,7 +2218,34 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
+        // LAYER 0 ONLY.  These were unconditional in the previous build, so the slot held the LAST layer while the
+        // hc-read bracket held layer 0 - and comparing across layers produced a "12% difference" that was an
+        // artefact.  Same layer on both sides or the comparison is meaningless.
+        if (l == 0) {
+            tpdiag_reduce_record(mixed_, 455, (int64_t) T * N, (int64_t) T * HC * N, cs);
+            // the weight's own bytes: shape and pointer arithmetic are provably identical, and the input is
+            // bit-identical, so if the logits differ the stored values do.
+            // (the weight probe that read 2.6 MB here is gone: it stretched the window past its timeout.
+            //  Measured while it was in: rank0 sum=-2.64693607 sumsq=49.612417, rank1 the same - bit identical.)
+        }
+        // MEASURED AND REVERTED: zeroing the router's output rows first (to test whether the top-10 was picking
+        // from a previous call's leftovers) changed nothing - eight requests gave
+        //   ['The','','我','The','We','The','The','The']   4 distinct, 'We' x1
+        // which is the baseline, so the router does write the range it selects from and the memset is not kept.
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
+        {
+            static int once_wr[2] = {0, 0};
+            const int rk_wr = strata::core::tp_rank_current() < 2 ? strata::core::tp_rank_current() : 0;
+            if (once_wr[rk_wr] < 4 && w_router != nullptr) { ++once_wr[rk_wr];
+                std::fprintf(stderr,
+                             "TPDIK rweight rank=%d l=%lld data=%p elements=%lld bytes=%llu kind=%d "
+                             "code_bits=%d ne0=%lld ne1=%lld\n",
+                             rk_wr, (long long) l, (const void*) w_router->data,
+                             (long long) w_router->elements, (unsigned long long) w_router->bytes,
+                             (int) w_router->kind, (int) w_router->code_bits,
+                             (long long) w_router->ne0, (long long) w_router->ne1);
+            }
+        }
         // S26 STRATA_LFUSE=1: the shared expert's gate row rides in the router GEMV launch, its sigmoid + row scale
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
@@ -1480,6 +2260,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+                // AFTER the top-10: this is the router's own output for THIS layer (recording it before the GEMV
+                // read the previous layer's leftovers and produced a false 'logits differ').
+                if (l == 0) tpdiag_reduce_record(logits_, 456, (int64_t) T * NE, (int64_t) T * HC * N, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
         } else if (dec_batch) {
@@ -1495,6 +2278,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             MoEBuffers mb = ss.moe;
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
+        }
+        if (l == 0) {
+            tpdiag_reduce_record((const float*) ids_, 453, (int64_t) T * 10, (int64_t) T * HC * N, cs);
+            tpdiag_reduce_record(w_, 454, (int64_t) T * 10, (int64_t) T * HC * N, cs);
         }
         // STRATA_ROUTE_PRIOR=lambda (opt-in, changes the output): the top-10 picked again with a logit bonus for the
         // resident experts; the weights stay the router's (route_prior.cu)
@@ -1677,6 +2464,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
                               native_moe_combine_enabled() && n <= 8 &&
                               native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
+            // TPDIAG: the RAW expert output for layer 0, before the combine.  `bo_` after the combine already
+            // differs between the ranks, and the input and routing are bit-identical, so this is the quantity to
+            // look at - a prefix is enough and keeps the blocking read small.
+            if (l == 0) tpdiag_reduce_record(parts_, 464, 61440, (int64_t) T * HC * N, cs);
             if (!hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
         }
         // Same condition as `sh_fork` above, which is per group and out of scope here: wait only when the fork
@@ -1708,25 +2499,58 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
         stamp(l, 24, grp);
+        if (l == 0) {   // post(0) bracket: branch-independent points only (a record inside the
+            tpdiag_reduce_record(bo_, 460, (int64_t) T * N, (int64_t) T * HC * N, cs);      // `if (l == g.n_layers - 1)`
+            tpdiag_reduce_record(inj2_, 461, (int64_t) T * HC, (int64_t) T * HC * N, cs);   // never ran at layer 0 at all)
+        }
         if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {
-                if (dec_batch && !g_no_multi_gr) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
+        if (dec_batch && !g_no_multi_gr) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
                 else for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
+        if (l == 0) tpdiag_reduce_record(R_, 462, (int64_t) T * HC * N, (int64_t) T * HC * N, cs);   // R after the write-back block
                 if (cvec().covers(l)) cvec_apply(Rt(tb), l, n, HC * N, nullptr, 0, nullptr, 0, false, cs);
             }
         } else if (cvec().covers(l)) {
             cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs);
+        if (l == 0) tpdiag_reduce_record(R_, 463, (int64_t) T * HC * N, (int64_t) T * HC * N, cs);   // R after the residual update
         }
         return true;
     };
 
-    for (int grp = 0; grp < G; ++grp)
+    tpdiag_input_record(R_, T, HC, N, cs);
+    tpdiag_reduce_record(mixed_, 302, (int64_t) T * N, (int64_t) T * HC * N, cs);
+    for (int grp = 0; grp < G; ++grp) {
         if (!pre(lb_, grp)) return false;
+        tpdiag_pre_record(R_, lb_, grp, T, HC, N, cs);
+    }
     for (int64_t l = lb_; l < le_; ++l)
         for (int grp = 0; grp < G; ++grp) {
             if (!post(l, grp)) return false;
+            // TPDIAG (temporary, STRATA_TP_DIAG_LAYERS=1): this rank's residual as it leaves layer `l`.  The
+            // design requires the two ranks to agree here outside the two reduced contractions, and this window
+            // is inside ONE forward pass, so the first layer whose line differs between the two logs is the layer
+            // where the divergence starts.  Copies to the host and therefore synchronises: a diagnostic, not a path.
+            // TPDIAG: record this rank's residual as it leaves layer `l`, WITHOUT breaking the capture this
+            // loop usually runs inside - a device-to-device copy is capture-legal, a synchronise is not.  The
+            // read-back happens after `cudaStreamEndCapture`.
+            if (tpdiag_full_on() && tpdiag_layer_on() && l >= 0 && l < 48) {
+                const int rk = strata::core::tp_rank_current() < 2 ? strata::core::tp_rank_current() : 0;
+                if (g_tpdiag_log[rk] != nullptr) {
+                    const size_t dn = (size_t) T * (size_t) HC * (size_t) N;
+                    const size_t slot = (size_t) l * 2 + (size_t) (grp < 2 ? grp : 0);
+                    if (dn != 0 && dn * (slot + 1) <= g_tpdiag_cap[rk])
+                        (void) cudaMemcpyAsync(g_tpdiag_log[rk] + dn * slot, R_, dn * sizeof(float),
+                                               cudaMemcpyDeviceToDevice, cs);
+                }
+            }
             if (l + 1 < le_ && !pre(l + 1, grp)) return false;
+            tpdiag_pre_record(R_, l + 1, grp, T, HC, N, cs);
         }
+    {
+        cudaStreamCaptureStatus cst = cudaStreamCaptureStatusNone;
+        const bool cap = cudaStreamIsCapturing(cs, &cst) == cudaSuccess && cst != cudaStreamCaptureStatusNone;
+        if (!cap) tpdiag_log_dump(T, HC, N, "live", (int64_t) windows);
+    }
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
         float* hout = hand_out_ + (size_t) hrow0 * HB;
         copy_from_mapped(hout, R_, (int64_t) T * HC * N, cs);
@@ -1826,6 +2650,33 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             sp.temperature = 0.0f;
             sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
         }
+        // TPDIAG: the head's top two, per rank.  The all-reduce hands both ranks the same sum (measured: 48 of 48
+        // post-reduce pairs agreed), so if the two ranks' LOGITS also agree while the token differs from the single
+        // card's, the split arithmetic itself differs from one card's and a temperature-0 pick between two near
+        // candidates flips on rounding alone - which is a different problem from a race, and says what to fix.
+        // behind the full-probe gate: reading 248k floats per window on the host stalls the pipeline and the
+        // run stops finishing inside its timeout (measured: 420 s timeout with it on, 85 s with it off).
+        if (tpdiag_full_on() && tpdiag_layer_on() && n_vocab_ > 0 && T > 0) {
+            static int once_l[2] = {0, 0};
+            const int rk_l = strata::core::tp_rank_current() < 2 ? strata::core::tp_rank_current() : 0;
+            if (once_l[rk_l] < 16) {
+                ++once_l[rk_l];
+                const float* row = head_logits_ + (size_t) (T - 1) * (size_t) n_vocab_;
+                std::vector<float> lv((size_t) n_vocab_);
+                if (cudaMemcpy(lv.data(), row, (size_t) n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost) ==
+                    cudaSuccess) {
+                    int b1 = 0, b2 = 0;
+                    for (int i = 1; i < (int) n_vocab_; ++i) {
+                        if (lv[(size_t) i] > lv[(size_t) b1]) { b2 = b1; b1 = i; }
+                        else if (b1 != i && lv[(size_t) i] > lv[(size_t) b2]) b2 = i;
+                    }
+                    std::fprintf(stderr,
+                                 "TPDIAG logits rank=%d T=%d top1=%d(%.6f) top2=%d(%.6f) gap=%.6g\\n", rk_l, T, b1,
+                                 (double) lv[(size_t) b1], b2, (double) lv[(size_t) b2],
+                                 (double) (lv[(size_t) b1] - lv[(size_t) b2]));
+                }
+            }
+        }
         // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
         if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
     }
@@ -1896,6 +2747,7 @@ bool Verifier::capture(int T, std::string& err) {
     const bool ok = record_window(T, cs_, rerr);
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    tpdiag_log_dump(T, g_->hc, g_->n_embd, "capture", (int64_t) 0);
     if (!ok) {
         if (graph) cudaGraphDestroy(graph);
         err = rerr;
@@ -2018,9 +2870,14 @@ bool Verifier::capture_commit(std::string& err) {
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     const QsaShapes s = shapes_of(g);
-    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ID = g.idx_key_dim, MT = max_t_;
-    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    // TENSOR PARALLEL: the GDN dimensions are this rank's, matching `init`'s sizing of the same buffers.
+    TpHeads tph_captured;
+    std::string tp_head_err_captured;
+    if (!tp_heads(g, tp_rank_current(), tp_ranks_current(), tph_captured, tp_head_err_captured)) return false;
+    const int64_t C = tph_captured.qkv_count(), HV = tph_captured.v_count,
+                  HK = tph_captured.q_count, ID = g.idx_key_dim, MT = max_t_;
+    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * gdn_v_heads_rank(g) * g.ssm_state_size +
+                                (uint64_t) gdn_channels_rank(g) * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
@@ -2053,9 +2910,9 @@ bool Verifier::capture_commit(std::string& err) {
             else if (n_gdn > 0)
                 gdn_batched = gdn_commit_layers(
                     ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats, (int64_t) gdn_floats,
-                    (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size, qkv_L_ + (size_t) gdn_index * MT * C,
+                    (int64_t) g.ssm_state_size * gdn_v_heads_rank(g) * g.ssm_state_size, qkv_L_ + (size_t) gdn_index * MT * C,
                     MT * C, h_L_ + (size_t) gdn_index * MT * C, MT * C, gate_L_ + (size_t) gdn_index * MT * HV,
-                    beta_L_ + (size_t) gdn_index * MT * HV, MT * HV, (int) C, (int) g.ssm_k_heads, (int) HV, (int) MT,
+                    beta_L_ + (size_t) gdn_index * MT * HV, MT * HV, (int) C, (int) HK, (int) HV, (int) MT,
                     (int) n_gdn, commit_, cs_);
         }
         // the QSA layers' tail restore + indexer append, one launch for all of them (one block per layer)
@@ -2095,12 +2952,12 @@ bool Verifier::capture_commit(std::string& err) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                 if (!wnm) { ok = false; break; }
                 float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
-                float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                float* conv = state + (uint64_t) g.ssm_state_size * gdn_v_heads_rank(g) * g.ssm_state_size;
                 const float* qkv = qkv_L_ + (size_t) gdn_index * MT * C;
                 gdn_conv_commit(conv, qkv, (int) C, commit_, cs_);
                 gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C, (int) C, gate_L_ + (size_t) gdn_index * MT * HV,
                                     beta_L_ + (size_t) gdn_index * MT * HV, z_, (const float*) wnm->data, EPS, y_dummy_,
-                                    (int) g.ssm_k_heads, (int) HV, (int) MT, commit_, cs_,
+                                    (int) HK, (int) HV, (int) MT, commit_, cs_,
                                     (int) MT);   // S26: t_out_begin = MT - the replay's outputs (y_dummy_) are never read
                 ++gdn_index;
             } else {
@@ -2145,14 +3002,17 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
-    int32_t* const pk = h_pos_ + (size_t) max_t_ * g.n_head;
-    int32_t* const pi = pk + (size_t) max_t_ * g.n_head_kv;
+    // TENSOR PARALLEL: `h_pos_` is carved by this rank's head count (`init` uses NH/NKV), so its stride has to
+    // be the rank's too - a full head count here would run past the end of the table.
+    const int64_t tp_hn = g.n_head / tp_ranks_current(), tp_hk = g.n_head_kv / tp_ranks_current();
+    int32_t* const pk = h_pos_ + (size_t) max_t_ * tp_hn;
+    int32_t* const pi = pk + (size_t) max_t_ * tp_hk;
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
         const int32_t pos_t = (int32_t) (pos0 + t);
-        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = pos_t;
-        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
+        for (int64_t h = 0; h < tp_hn; ++h) h_pos_[t * tp_hn + h] = pos_t;
+        for (int64_t h = 0; h < tp_hk; ++h) pk[t * tp_hk + h] = pos_t;
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
     }
     *(volatile uint32_t*) h_seq_ = 0;
@@ -2243,6 +3103,19 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const OnDevice on_device(device_);
     last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    // TPDIAG: the window sequence, per rank.  Two ranks that visit different (or differently ordered) windows
+    // compute different token positions, which is one explanation for every per-layer divergence measured so far
+    // - and `rank 1 gave up waiting for its peer` says they are not in step.  Host-side, so it costs nothing.
+    {
+        static int64_t nwin[2] = {0, 0};
+        const int rk_w = strata::core::tp_rank_current() < 2 ? strata::core::tp_rank_current() : 0;
+        if (tpdiag_layer_on() && nwin[rk_w] < 24) {
+            std::fprintf(stderr, "TPDIAG winseq rank=%d n=%lld T=%d pos0=%lld first=%d last=%d\n", rk_w,
+                         (long long) nwin[rk_w], T, (long long) pos0, T > 0 ? tokens[0] : -1,
+                         T > 0 ? tokens[T - 1] : -1);
+        }
+        ++nwin[rk_w];
+    }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -2302,7 +3175,26 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (ar_on() && !test_stall) {
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
-            if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+            // TPDIAG: HOST-side, so no probe and no risk of hanging the window.  The row indices are a pure function
+        // of the tokens (both ranks must agree); the gathered embeddings come from `ss.ple.table`, and if that
+        // object is shared between the ranks its row cache and prefetch state are too.
+        {
+            static int once = 0;
+            if (once < 8) {
+                ++once;
+                uint64_t rs = 0, re = 0;
+                for (int i = 0; i < (int) (T * strata::kernels::PLE_N_HEADS); ++i) rs = rs * 1315423911ull + ple_rows[i];
+                for (int64_t i = 0; i < (int64_t) T * g_->n_embd; ++i) {
+                    float v = 0.0f;
+                    std::memcpy(&v, (const char*) h_ple_ + (size_t) i * 4, sizeof(float));
+                    uint32_t b; std::memcpy(&b, &v, 4); re = re * 1099511628211ull + b;
+                }
+                std::fprintf(stderr, "TPDIAG ple rank=%d T=%d rows_hash=%016llx row0=%u emb_hash=%016llx\n",
+                             strata::core::tp_rank_current(), T, (unsigned long long) rs,
+                             (unsigned) ple_rows[0], (unsigned long long) re);
+            }
+        }
+        if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
             *flag = 1;
@@ -2495,6 +3387,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     ++windows;
     progress_at("decode");
     progress_beat();
+    // TPDIAG: this is the first point that is BOTH outside any capture and AFTER the graphs have replayed, which
+    // is what makes the recorded residuals readable.  A dump right after `cudaStreamEndCapture` reads a buffer the
+    // replays have not written yet - that is why the per-capture dumps looked empty on one rank.
+    tpdiag_log_dump(T, g_->hc, g_->n_embd, "live", (int64_t) windows);
     return true;
 }
 
@@ -2771,6 +3667,7 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     row_base_ = 0;
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    tpdiag_log_dump(S, g_->hc, g_->n_embd, "batch", (int64_t) 0);
     if (!ok || ce != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = !ok ? rerr : std::string("verify: end batch capture: ") + cudaGetErrorString(ce);
@@ -2793,10 +3690,15 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
-    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ZV = g.ssm_value_dim, ID = g.idx_key_dim, MT = max_t_;
+    // TENSOR PARALLEL: the GDN dimensions are this rank's, matching `init`'s sizing of the same buffers.
+    TpHeads tph_pipe;
+    std::string tp_head_err_pipe;
+    if (!tp_heads(g, tp_rank_current(), tp_ranks_current(), tph_pipe, tp_head_err_pipe)) return false;
+    const int64_t C = tph_pipe.qkv_count(), HV = tph_pipe.v_count, ZV = tph_pipe.v_count * tph_pipe.head,
+                  HK = tph_pipe.q_count, ID = g.idx_key_dim, MT = max_t_;
     const int64_t CB = 2 + MT, nQ = g.n_qsa_layers();
-    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * gdn_v_heads_rank(g) * g.ssm_state_size +
+                                (uint64_t) gdn_channels_rank(g) * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
@@ -2821,14 +3723,14 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                     SessionState& sx = *slots_[(size_t) rows[first]];
                     const int32_t* keep = commitb_ + (size_t) rows[first] * CB;
                     float* state = sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats;
-                    float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    float* conv = state + (uint64_t) g.ssm_state_size * gdn_v_heads_rank(g) * g.ssm_state_size;
                     gdn_conv_commit(conv, qkv_L_ + (size_t) gdn_index * MT * C + (size_t) first * C,
                                     (int) C, keep, cs_);
                     gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C + (size_t) first * C, (int) C,
                                         gate_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
                                         beta_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
                                         z_ + (size_t) first * ZV, (const float*) wnm->data, EPS,
-                                        y_dummy_ + (size_t) first * ZV, (int) g.ssm_k_heads,
+                                        y_dummy_ + (size_t) first * ZV, (int) HK,
                                         (int) HV, t - first, keep, cs_,
                                         t - first > 1 ? t - first : 0);   // a 1-row group keeps the 0.1.39 kernel
                 }
@@ -2964,10 +3866,11 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     for (int t = 0; t < S; ++t) {
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos[t], s);
-        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) pos[t];
-        int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;
-        int32_t* pi = pk + (size_t) max_t_ * g.n_head_kv;
-        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) pos[t];
+        const int64_t tp_hn = g.n_head / tp_ranks_current(), tp_hk = g.n_head_kv / tp_ranks_current();
+        for (int64_t h = 0; h < tp_hn; ++h) h_pos_[t * tp_hn + h] = (int32_t) pos[t];
+        int32_t* pk = h_pos_ + (size_t) max_t_ * tp_hn;
+        int32_t* pi = pk + (size_t) max_t_ * tp_hk;
+        for (int64_t h = 0; h < tp_hk; ++h) pk[t * tp_hk + h] = (int32_t) pos[t];
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) pos[t];
     }
     if (ss_->ple.ready() && ple_stage()) {

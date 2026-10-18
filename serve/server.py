@@ -2564,10 +2564,32 @@ def layer_split_value(cfg: dict) -> str:
     return ",".join(str(x) for x in vals)
 
 
+def tp_of(cfg: dict) -> bool:
+    """The config asks for TENSOR parallelism: `"tp": 2`, `"tp": true`, or `"tp": [0, 2]` (a list names the CARDS,
+    the way "gpu" does).  TP and the layer split are two different ways to spend a second card and the engine
+    refuses both at once (`program/tp_rules.hpp`), so a config that asks for TP deliberately does NOT get
+    --layer-split.  Off: absent, false, 0, or an empty list."""
+    v = cfg.get("tp")
+    if v is None:
+        return False
+    # `True` and `2` both mean "on" (the engine's value is always 2), and `isinstance(True, int)` is True, so the
+    # integer branch covers the boolean spelling as well
+    if isinstance(v, int):
+        return v > 0
+    return isinstance(v, (list, tuple, str)) and len(v) > 0
+
+
+def tp_value(cfg: dict) -> str:
+    """The engine's --tp value.  The engine has exactly one (2: `n_head_kv` is 2, so a third rank would have
+    no KV head of its own), so a list in the config names the CARDS rather than the rank count."""
+    return "2"
+
+
 def layer_split_of(cfg: dict) -> bool:
     """Several GPUs in the config are a layer split, unless the args put the later card(s) to another use: with
-    --peer-device the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665)."""
-    return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
+    --peer-device the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665).
+    A config that asks for TP is not a layer split either - the two are mutually exclusive by design."""
+    return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"] and not tp_of(cfg)
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -2587,6 +2609,10 @@ def engine_args(cfg: dict) -> list[str]:
             note += " and --vram-reserve-mib 700"
         print(f'[strata] the config has a "vision" section but no --vision in its args: {note} (run setup again with '
               "--vision to write them)", flush=True)
+    if tp_of(cfg) and "--tp" not in args:
+        # Tensor parallelism: both ranks run every layer and split each dense tensor, so the cards come from
+        # "gpu" as they do for a layer split (and `layer_split_of` is false here, so nothing else is added).
+        args += ["--tp", tp_value(cfg)]
     if layer_split_of(cfg) and "--layer-split" not in args:
         args += ["--layer-split", layer_split_value(cfg)]
     # opt-in: an auto split runs on the first card alone when it holds every profiled expert and the KV
@@ -6722,7 +6748,27 @@ def main() -> int:
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
-        if layer_split_of(cfg):
+        if tp_of(cfg):
+            # The engine is the authority on this (`program/tp_rules.hpp`); what is checked here is only what
+            # would otherwise cost a model load before the same complaint.  Both ranks must run the SAME
+            # reduces in the SAME order, so every flag that makes one rank's window differ is refused.
+            cards = gpu_list(cfg)
+            if len(cards) != 2:
+                raise SystemExit(f'[strata] config: "tp" needs exactly two cards, and "gpu" names {len(cards)}')
+            _eargs = engine_args(cfg)
+            # Only --layer-split is refused here (and by the engine): it is the other way to spend a second
+            # card.  Everything else - --vision, --kv-resident, --mmap-experts, --batch, --pipeline-windows,
+            # --peer-device, the mid-prompt cache - is NOT refused: both ranks run the same window on the same
+            # tokens, so images go through the same vision path and each rank streams its own share of the KV.
+            # `program/tp_rules.hpp` is the authority and refuses none of it ("llama.cpp's tensor parallelism
+            # refuses none of it, and neither does this one"); this check only saves a model load before the
+            # engine's own complaint.
+            for bad, why in (("--layer-split", "it is the other way to use a second card"),):
+                if bad in _eargs:
+                    raise SystemExit(f'[strata] config: "tp" cannot be combined with {bad} ({why})')
+            print(f"[strata] tensor parallel across GPUs {cards} (both cards run every layer; "
+                  "see docs/MULTI_GPU.md)", flush=True)
+        elif layer_split_of(cfg):
             try:
                 split = layer_split_value(cfg)          # #644: before the (minutes-long) start
             except ValueError as e:

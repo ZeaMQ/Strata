@@ -59,6 +59,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
+#include "strata/program/tp_pair.hpp"   // one tensor-parallel rank's state (TP=2)
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
@@ -70,6 +71,7 @@
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/split_rules.hpp"
+#include "strata/program/tp_rules.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
 #include "strata/program/split_ring.hpp"
@@ -617,6 +619,15 @@ struct Options {
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
+    /// --tp N (opt-in): TENSOR parallelism - both cards run every layer and each dense tensor's output axis is
+    /// cut in half, with the two ranks meeting on an all-reduce twice per layer (`kernels/allreduce.hpp`).  The
+    /// value is 2: `n_head_kv` is 2, so a third rank would have no KV head of its own.  Mutually exclusive
+    /// with --layer-split, and the whole refusal list is in `program/tp_rules.hpp` so it can be tested without
+    /// a GPU.  0 = off, and the default path is byte-identical to a build without any of this.
+    int tp = 0;
+    /// --tp-device 0 makes both ranks share one card: the all-reduce becomes a local add, which is the
+    /// A/B of the split itself (the trick `--split-device 0` plays for the layer split).  A contraction`n    /// split reassociates the sum, so this compares to fp32 accumulation error rather than byte for byte.
+    std::string tp_device;
     /// --split-skip-if-fits (opt-in; the server passes it for a config's "split_skip_if_fits"): with
     /// --layer-split auto, run on CUDA0 alone when it holds every profiled expert pair plus the whole session (KV),
     /// the drafter and the reserve - a split then only adds hand-offs (two RDNA4 cards: 1,384 vs 1,794 tok/s at 4K)
@@ -706,6 +717,14 @@ void usage() {
                  "  --gpu LIST           run on these GPUs, comma-separated nvidia-smi/PCI indices (default: every\n"
                  "                       visible one); sets CUDA_VISIBLE_DEVICES/CUDA_DEVICE_ORDER inside the engine,\n"
                  "                       so a caller never has to export environment variables\n"
+                 "  --tp N               TENSOR parallelism (opt-in, needs --serve and two cards, N = 2): both cards run\n"
+                 "                       every layer and each dense tensor's output axis is cut in half, with the two\n"
+                 "                       ranks meeting on an all-reduce.  Not with --layer-split, --batch,\n"
+                 "                       --pipeline-windows, --peer-device, --vision, --mmap-experts, --kv-resident or a\n"
+                 "                       session file: each makes the two ranks' windows differ, and a rank that skips a\n"
+                 "                       call leaves its peer waiting.  The engine prints why and continues on one card\n"
+                 "  --tp-device D        with --tp, the second rank's GPU (default: the next visible one; \"0\" puts both\n"
+                 "                       ranks on one card: the A/B of the split, without a second card's VRAM)\n"
                  "  --ple-gguf PATH      required PLE table (original second GGUF shard); with --native, the model's\n"
                  "                       shard that holds per_layer_token_embd.weight when not given\n"
                  "  --no-ple             explicit diagnostic ablation of the PLE layer\n"
@@ -983,6 +1002,13 @@ bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) 
 }
 
 /// The pool's adapter plus the wall-clock it spent, so the report can say how much of the token was the CPU.
+/// TENSOR PARALLEL: this card's free VRAM, taken BEFORE rank 1's context exists.  The expert-cache sizing reads
+/// `device_free_bytes()`, and on WDDM a process that holds a second card's context makes `cudaMemGetInfo` report
+/// 0 free on the first one - measured: the sizing saw "device 0, 0 MiB free" and sized the cache to zero slots,
+/// which is what leaves every expert in host RAM.  So the reading is taken here instead.
+static size_t g_tp_free_bytes = 0;
+
+/// One rank of a tensor-parallel pair.  (placeholder to keep the anchor stable)
 struct Drive {
     strata::core::ExpertDispatch d;
     double cpu_ms = 0;
@@ -1024,12 +1050,35 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
 }
 
 /// Plan v0.3 P6: the pool for a verify window.
+/// TENSOR PARALLEL: THE TWO RANKS SHARE THE EXPERT MACHINERY.  `ExpertDispatch` holds POINTERS - the pool, the
+/// cache, the source, the lookahead, the remote tiers - and the per-rank `Drive` copy duplicates only the struct,
+/// so both ranks dispatch into the SAME pool and cache at the same time.  Dispatched concurrently they race, and
+/// then the ranks compute with different experts; this whole design rests on the two residuals agreeing outside
+/// the two reduced contractions, so that race alone is enough to garble every layer after it.  This serialises
+/// the dispatch while a pair is installed.  Correctness first - P2 (experts split by id) removes the sharing
+/// entirely and is also the only path past ~1.2x, so this lock is a waypoint, not the destination.
+static bool g_tp_pool_serialise = false;
+static std::mutex g_tp_pool_mutex;
+
 void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                       int64_t layer) {
     Drive* t = (Drive*) user;
     t->d.layers = layer;
+    // TPDIAG (temporary, STRATA_TP_NO_MOE=1): the experts are skipped ENTIRELY, on both ranks, so nothing the two
+    // ranks share is touched.  The answer is wrong (there are no experts at all), but a still-nondeterministic
+    // answer then says the race is NOT in the expert path - which is what this switch exists to decide.
+    if (const char* nm = std::getenv("STRATA_TP_NO_MOE"); nm != nullptr && nm[0] != (char) 0 && nm[0] != (char) 48) {
+        (void) cudaMemsetAsync(out, 0, (size_t) n_tok * (size_t) k * (size_t) 2560 * sizeof(float),   // n_embd, fixed here
+                              (cudaStream_t) strata::core::tpdiag_window_stream());
+        ++t->calls;
+        return;
+    }
     const Clock::time_point a = Clock::now();
-    strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
+    {
+        std::unique_lock<std::mutex> lock(g_tp_pool_mutex, std::defer_lock);
+        if (g_tp_pool_serialise) lock.lock();
+        strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
+    }
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
     // the routing trace for the serve path: the same record format drive_pool writes (layer, k, ids, weights),
@@ -2098,6 +2147,8 @@ int main(int argc, char** argv) {
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
         else if (a == "--split-device") o.split_device = next("--split-device");
+        else if (a == "--tp") o.tp = std::atoi(next("--tp"));
+        else if (a == "--tp-device") o.tp_device = next("--tp-device");
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
@@ -2307,6 +2358,10 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    // NOTE: this flag is NOT the place to make a tensor-parallel rank's mapped buffers portable - other code
+    // reads it as "a layer split is running" (`prefill.cpp`), so setting it for `--tp` changed control flow
+    // elsewhere and broke the collective's result (measured: the reduce's post value went from bit-identical on
+    // both ranks to rank 1 still holding its own half).  The verifier's own `mapped()` now decides for itself.
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     {   // the RAM guard (parking, session save/restore): --memory-limit-mib, else STRATA_MEMORY_LIMIT_MIB, else none
         int64_t mib = o.memory_limit_mib;
@@ -2403,6 +2458,55 @@ int main(int argc, char** argv) {
                                  "GPUs, not \"24,12,6,6\" (got \"%s\")\n", n_dev - 1, o.layer_split.c_str());
             return 2;
         }
+    }
+    // ---- --tp: tensor parallelism.  EVERY rule lives in `program/tp_rules.hpp`, where it is tested without a
+    // GPU, a model or a command line; here the engine's own parsed flags are handed to it and the one line it
+    // returns is printed.  A refusal then continues on one card, because opt-in has to mean the cost of asking
+    // is a line in the log and not a run that does not start.
+    if (o.tp > 0) {
+        strata::program::tp_rules::Options tpo;
+        tpo.tp = o.tp;
+        tpo.serve = o.serve;
+        tpo.layer_split = !o.layer_split.empty();
+        tpo.gpus = strata::core::device_count();   // `n_dev` is scoped to the layer-split block above
+        // --tp-device: -1 when not given (the next visible card), otherwise the card the user named - and the
+        // rule refuses one this run does not have rather than parsing it and ignoring it.
+        tpo.second_device = o.tp_device.empty() ? -1 : std::atoi(o.tp_device.c_str());
+        // One binary is one backend (CUDA or HIP), and a card the build cannot run on is refused when its
+        // `DeviceInfo` is read (`core/device.hpp:51-54`) - so both of these are already settled here.
+        tpo.same_backend = true;
+        tpo.weakest_cc_major = strata::program::tp_rules::kMinCcMajor;
+        tpo.weakest_cc_minor = strata::program::tp_rules::kMinCcMinor;
+        tpo.batch = o.batch > 0;
+        tpo.pipeline_windows = o.pipeline_windows > 0;
+        tpo.peer_device = o.peer_device >= 1;
+        tpo.remote_experts = o.remote_expert_opt || o.expert_cache_remote[0] > 0 ||
+                             o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+        tpo.vision = o.vision;
+        tpo.mmap_experts = o.mmap_experts;
+        tpo.kv_resident = o.kv_resident > 0;
+        // The mid-prompt checkpoint's period has a POSITIVE DEFAULT, so `o.prompt_cache > 0` is true on a run
+        // that never mentioned it - and a rule that fires by default refuses every run, which this smoke test
+        // caught: "--tp 2 is off: --tp is off with --prompt-cache-every".  It is therefore not handed to the
+        // rule here; the server still refuses it when the CONFIG names it, and TP's own parking support is on
+        // the not-yet list either way.  What the engine does instead is turn the parking off for a TP window,
+        // the way it turns `--pipeline-windows` off rather than refusing the run.
+        tpo.prompt_cache_every = false;
+        // A session file is refused for a split stage anyway (`conversation_file.cpp:1032`), so the engine does
+        // not have to say it twice; the server refuses one before the model loads.
+        tpo.session_files = false;
+        const std::string tp_why = strata::program::tp_rules::refusal(tpo);
+        if (!tp_why.empty()) {
+            std::fprintf(stderr, "strata generate: --tp %d is off: %s\n", o.tp, tp_why.c_str());
+            o.tp = 0;
+        }
+        // ---- and the gate that stood here until the COMPUTE side was wired ---------------------------------
+        // It refused to engage `--tp` because the layer code read the FULL extents of the split tensors: the
+        // contraction splits (`ssm_out`, `attn_output`) were partial sums nobody reduced, and the head loops ran
+        // over every head while a rank held half of them.  Both are done - the reduces go through
+        // `TpRuntime::current()` at the two contraction sites, and the head counts (QSA's `NH`/`NKV` and the GDN
+        // block's `C`/`HV`/`HK`) come from `tp_heads`/`tp_ranks_current()` - so the gate is gone.  What still
+        // guards the flag is the rule list above, and the A/B that says the split is right.
     }
     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
     bool split_own_auto = false;   // #340: the split keeps own prompt buffers by its rule (not --no-prefill-borrow)
@@ -3111,7 +3215,32 @@ int main(int argc, char** argv) {
                      (long long) split_at[0] - 1);
     }
     uint64_t pool_bytes = 0;
-    if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+    // ---- --tp: this rank's split plan, built BEFORE the arena is sized ---------------------------------
+    // Nothing below runs unless --tp asked for it, so a single-card run builds no plan and hands the loader a
+    // null pointer - and a loader that is handed no plan reads every tensor whole, which is what keeps the
+    // default path byte-identical.  The arena is sized from the SHARDED bytes, because a plan that does not
+    // fit is refused at startup rather than halfway through a 5 GB upload.
+    strata::core::ShardTable shard_table;
+    strata::core::ShardPlan shard_plan;
+    const strata::core::ShardPlan* shard_arg = nullptr;
+    if (o.tp > 0) {
+        // Rank 0 is the process's own weights; the second rank's arena is the stage path (`GpuStage`), which
+        // this flag turns into a peer that runs every layer instead of a range of them.
+        const int tp_rank = 0;
+        if (!strata::core::shard_table(g, tp_rank, shard_table, err)) {
+            std::fprintf(stderr, "strata generate: --tp %d: %s\n", o.tp, err.c_str());
+            return 2;
+        }
+        if (!strata::core::shard_plan_layers(shard_table, g, tp_rank, shard_plan, err)) {
+            std::fprintf(stderr, "strata generate: --tp %d: %s\n", o.tp, err.c_str());
+            return 2;
+        }
+        shard_arg = &shard_plan;
+        std::fprintf(stderr, "strata generate: --tp %d: rank %d holds its own output-axis range of the dense "
+                             "tensors the plan cuts (see program/tp_rules.hpp and core/shard.hpp)\n",
+                     o.tp, tp_rank);
+    }
+    if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip, shard_arg)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
@@ -3155,7 +3284,7 @@ int main(int argc, char** argv) {
         return s;
     };
     strata::core::WeightTable wt;
-    if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+    if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip, shard_arg)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
@@ -3166,7 +3295,7 @@ int main(int argc, char** argv) {
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
-        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
+        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, 0, -1, shard_arg)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
         }
@@ -3282,7 +3411,17 @@ int main(int argc, char** argv) {
     // is a mapping of the ORIGINAL second GGUF shard, the six weights are already loaded in the arena, and the
     // three buffers are the only allocation.
     strata::kernels::PleTable ple_table;
+    // RANK 1'S OWN READER.  `PleTable` carries a row cache, prefetch TICKETS and an IO worker, and one object
+    // cannot serve two ranks: sharing it made the reader refuse a rank's gather outright -
+    //   `strata serve: PleReader: unknown ticket` / `400 invalid request: PleReader: unknown ticket`
+    // because rank 0's prefetch state had replaced rank 1's ticket.  So rank 1 gets its own reader over the same
+    // file; the row cache and the worker are per-reader by construction.
+    strata::kernels::PleTable ple_table1;
     std::vector<float> ple_emb_host((size_t) strata::kernels::NG_N_EMBD);
+    // rank 1's own copy of the per-token PLE staging: sharing one vector let the two ranks overwrite each
+    // other's row (that was introduced by the rank-1 PLE wiring below and is a data race, not a schedule one -
+    // the window sequences are identical, measured with `TPDIAG winseq`).
+    std::vector<float> ple_emb_host1((size_t) strata::kernels::NG_N_EMBD);
     float* ple_emb_dev = nullptr;
     float* ple_scratch = nullptr;
     if (!o.ple_gguf.empty()) {
@@ -3417,6 +3556,14 @@ int main(int argc, char** argv) {
         ss.ple.consts = strata::kernels::ple_artifact_consts();
         if (o.ple_delay_us > 0) ple_table.set_injected_delay_us(o.ple_delay_us);
         ss.ple.table = &ple_table;
+        // RANK 1'S OWN READER, opened on the path that actually runs (the earlier attempt landed inside the Mmap
+        // fallback's `else`, so `ple_table1.rows()` stayed 0 and both ranks kept sharing one reader - measured:
+        // both printed the same `table=` pointer and the engine answered `PleReader: unknown ticket`).  One reader
+        // cannot serve two ranks: it holds the prefetch TICKETS, the row cache and the IO worker.
+        if (o.tp > 0 && !ple_table1.open(o.ple_gguf, err, pio)) {
+            std::fprintf(stderr, "strata generate: rank 1's PLE reader: %s\n", err.c_str());
+            return 1;
+        }
         ss.ple.token = &ss.ple_token;
         ss.ple.prev = ss.ple_prev;
         // `ss.ple.hist` and the ready() check wait for `session_init`, which carves the history - the session is
@@ -3581,6 +3728,22 @@ int main(int argc, char** argv) {
         }
         return true;
     };
+    // TENSOR PARALLEL: rank 1's device and stream are opened HERE, beside the layer split's own stages - before
+    // the host arena is registered (a context made after that breaks this engine's mapped allocations, measured)
+    // and before the biggest allocations, so its stream can still be created at all (asked for later it comes
+    // back `out of memory`).  THIS CARD'S FREE VRAM IS READ FIRST, for the reason `g_tp_free_bytes` states.
+    strata::program::TpRank tp1;
+    strata::kernels::ArPair tp_pair;
+    std::unique_ptr<strata::core::TpHostRuntime> tp_rt0, tp_rt1;
+    if (o.tp > 0) {
+        {
+            size_t fb = 0, tb = 0;
+            if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) g_tp_free_bytes = fb;
+        }
+        // `build` (far below) opens this rank's device and stream: it runs AFTER the engine has allocated the
+        // expert cache, and a second card's context created before that makes the cache's own `cudaMalloc` fail
+        // `out of memory` on a card with 16 GiB free (measured, WDDM).
+    }
     for (size_t i = 0; multi_gpu && i < split_devs.size(); ++i) {
         stages.push_back(std::make_unique<GpuStage>());
         GpuStage& st = *stages.back();
@@ -3785,7 +3948,7 @@ int main(int argc, char** argv) {
         }
         if (!o.native_dense_gguf.empty()) {
             uint64_t dense = 0;
-            if (!strata::core::NativeDense::weight_bytes_for(o.native_dense_gguf, wt, o.native_ple_key, lb, le, dense, err)) {
+            if (!strata::core::NativeDense::weight_bytes_for(o.native_dense_gguf, wt, o.native_ple_key, lb, le, dense, err, shard_arg)) {
                 carve_ok = false;
                 return 0;
             }
@@ -4906,7 +5069,12 @@ int main(int argc, char** argv) {
         // in the resident arena; their streamed experts go through the pinned staging ring.  A Linux driver has no
         // such limit, so there the whole arena is pinned (#253).  STRATA_ARENA_PIN_GIB overrides both ways.
         const int pin_env = strata::core::arena_pin_cap_gib();   // -1 unset, -2 "auto" (#243, Windows sliced pin)
-        const bool pin_wddm_cap = pin_env < 0 && (o.expert_cache_remote[0] > 0 || multi_gpu) && under_wddm();
+        // `o.tp > 0` belongs here with the layer split and the remote caches: tensor parallel is a second context on
+        // a second card, and the whole-arena pin that a single-GPU run takes is exactly what makes WDDM refuse the
+        // engine's own later allocations once that context exists (measured: the expert cache's `cudaMalloc`, then
+        // its fill, `out of memory` on a card with 16 GiB free).
+        const bool pin_wddm_cap = pin_env < 0 && (o.expert_cache_remote[0] > 0 || multi_gpu || o.tp > 0) && under_wddm();
+        g_tp_pool_serialise = o.tp > 0;   // see the note on the expert dispatch: the pair shares one pool
         const uint64_t pin_limit = pin_env >= 0 ? (uint64_t) pin_env << 30 : pin_wddm_cap ? (8ull << 30) : 0;
         if (pin_env >= 0)
             std::fprintf(stderr, "strata generate: STRATA_ARENA_PIN_GIB=%d: %s\n", pin_env,
@@ -5106,7 +5274,7 @@ int main(int argc, char** argv) {
     };
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
-        free_b = strata::core::device_free_bytes(); (void) total_b;
+        free_b = g_tp_free_bytes ? g_tp_free_bytes : strata::core::device_free_bytes(); (void) total_b;
         if (free_b == 0 && o.prefill_head_alias) {
             (void) cudaGetLastError();
             free_b = strata::core::device_free_bytes();
@@ -5137,6 +5305,7 @@ int main(int argc, char** argv) {
             }
 #endif
         }
+
         const int64_t prefill_mib = owned_prefill_mib();
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
@@ -5230,7 +5399,8 @@ int main(int argc, char** argv) {
         // fails with "device buffers ... do not fit" (with borrowing - the default with a profile - the path lends
         // slots instead and `prefill_mib` is 0, so only the reserve is checked)
         size_t free_b = 0, total_b = 0;
-        free_b = strata::core::device_free_bytes(); (void) total_b;
+        free_b = g_tp_free_bytes ? g_tp_free_bytes : strata::core::device_free_bytes(); (void) total_b;
+
         const int64_t prefill_mib = owned_prefill_mib();
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + pipe_first;
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
@@ -5252,7 +5422,7 @@ int main(int argc, char** argv) {
     std::vector<int64_t> sized_slots;
     uint64_t per_layer_bytes = 0;
     if (native_pack && o.expert_cache > 0 && o.expert_cache_per_layer) {
-        const size_t free_b = strata::core::device_free_bytes();   // the same reading the shared-cache sizing uses
+        const size_t free_b = g_tp_free_bytes ? g_tp_free_bytes : strata::core::device_free_bytes();
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int asked = o.expert_cache;
         const uint64_t budget = (uint64_t) asked * lay.max_blob;
@@ -5278,7 +5448,16 @@ int main(int argc, char** argv) {
         }
     } else if (native_pack && o.expert_cache > 0 && !profile.empty()) {
         size_t free_b = 0, total_b = 0;
-        free_b = strata::core::device_free_bytes(); (void) total_b;
+        free_b = g_tp_free_bytes ? g_tp_free_bytes : strata::core::device_free_bytes(); (void) total_b;
+        {
+            int tpd = -1;
+            cudaGetDevice(&tpd);
+            cudaDeviceProp tppr{};
+            (void) cudaGetDeviceProperties(&tppr, tpd >= 0 ? tpd : 0);
+            std::fprintf(stderr, "strata generate: cache sizing sees device %d (%s), %zu MiB free, reserve %d, "
+                                 "profile %zu, asked %d\n", tpd, tppr.name, free_b >> 20, o.vram_reserve_mib,
+                         profile.size(), o.expert_cache);
+        }
         const auto& lay = strata::kernels::cpu::expert_layout();
         // what the uniform sizing granted, in the 256-byte slots the loop below counts: the blob formats of 1280 / 2560
         // rows are whole multiples of 256 already; an NVFP4 blob's 16-byte scale tail is not, and the unrounded budget
@@ -5376,6 +5555,17 @@ int main(int argc, char** argv) {
                 ok = sized_slots.empty()
                     ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
                     : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, err);
+                // TENSOR PARALLEL: rank 1's context, opened ONLY ONCE the engine's own cache holds its memory.
+                // On WDDM a second card's context made before this `cudaMalloc` fails it `out of memory` on a card
+                // with 16 GiB free (measured), because a device allocation is charged to the system commit too.
+                if (ok && o.tp > 0 && tp1.dev < 0) {
+                    std::string tp_e;
+                    const int tp_d1 = o.tp_device.empty() ? 1 : std::atoi(o.tp_device.c_str());
+                    if (!tp1.open(tp_d1, 1, 2, tp_e)) {
+                        std::fprintf(stderr, "strata generate: --tp %d: %s\n", o.tp, tp_e.c_str());
+                        return 1;
+                    }
+                }
             }
             if (!ok) {
                 // Issue #60: on Windows a device allocation is also charged to the system commit (RAM + page file),
@@ -5389,7 +5579,21 @@ int main(int argc, char** argv) {
                     std::snprintf(commit, sizeof commit, " (Windows has %.1f GiB of commit left: RAM + page file)",
                                   (double) ms.ullAvailPageFile / 1073741824.0);
 #endif
-                if (auto_cache && failed < 8 && shrink_to(cache_bytes() / 4 * 3)) {
+                // FILL THE VRAM THAT IS ACTUALLY FREE, not a fixed 3/4 of the current size: measured on two cards,
+                // the first attempt was 15.28 GiB against 13.29 GiB free, and the 3/4 step (11.46 GiB) threw away
+                // 1.83 GiB - that is the whole gap between TP's ~18.4 GB and a tuned PP's ~19.5 GB.  The free figure
+                // read once the refused allocation has settled is the accurate one (the pre-allocation read runs
+                // ~0.7 GiB high under WDDM, which the WDDM note above describes).
+                // THE ACCURATE FIGURE: this is the same call (`device_free_bytes`) the ExpertCache's own refusal
+                // uses, and there it read 13.29 GiB; `g_tp_free_bytes` is the pre-context reading and is far too
+                // high once the weights and the K/V are on the card, which is why the fixed 3/4 step below could
+                // never see the slack.  A zero (the WDDM two-context quirk) falls back to that fixed step.
+                const int64_t free_now = (int64_t) strata::core::device_free_bytes();
+                const int64_t want_bytes = ((int64_t) o.vram_reserve_mib << 20) + pipe_first;
+                const int64_t fill_to = free_now > (1ll << 30)
+                    ? std::max<int64_t>(0, free_now - want_bytes) + (32ll << 20) : 0;   // 32 MiB slack
+                const int64_t shrink_target = fill_to > 0 && fill_to < cache_bytes() ? fill_to : cache_bytes() / 4 * 3;
+                if (auto_cache && failed < 8 && shrink_to(shrink_target)) {
                     ++failed;
                     std::fprintf(stderr, "strata generate: %s%s; trying a smaller expert cache: %d slots\n", err.c_str(),
                                  commit, o.expert_cache);
@@ -5407,7 +5611,7 @@ int main(int argc, char** argv) {
             cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
-            free_b = strata::core::device_free_bytes(); (void) total_b;
+            free_b = g_tp_free_bytes ? g_tp_free_bytes : strata::core::device_free_bytes(); (void) total_b;
             const int64_t want = ((int64_t) o.vram_reserve_mib << 20) + pipe_first;
             if ((int64_t) free_b >= want - (64ll << 20)) break;
             // short by (want - free); a figure of 0 only says "at least": the first two such reads give back 1 GiB
@@ -5809,7 +6013,13 @@ int main(int argc, char** argv) {
                           [] { const char* v = std::getenv("STRATA_FS_AHEAD"); return v == nullptr || std::atoi(v) != 0; }();
     // STRATA_LOOKAHEAD_STATS=1 (measurement only): run the predictor on any tier and score it against the real routing
     const bool la_stats = srcp != nullptr && [] { const char* v = std::getenv("STRATA_LOOKAHEAD_STATS"); return v != nullptr && std::atoi(v) != 0; }();
-    if (srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
+    // NOT FOR A TENSOR-PARALLEL PAIR.  The lookahead is ONE object (`strata::core::RouterLookahead lookahead;`
+    // just above) and `Drive drive1 = drive` copies only the struct, so both ranks share it - and it runs its own
+    // prefetch thread OUTSIDE the drive lock (`g_tp_pool_serialise`).  It only warms pages, so not starting it
+    // changes no computed value.  Measured, three identical requests at temperature 0, first token:
+    //   with it on  0 of 3 agreed  (['S', 'a', '用户'])
+    //   STRATA_LOOKAHEAD=0   2 of 3 agreed  (['S', 'The', 'The'])
+    if (o.tp <= 0 && srcp != nullptr && ((srcp == &src && src.warms()) || fs_ahead || la_stats) &&
         [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
@@ -7259,6 +7469,10 @@ int main(int argc, char** argv) {
                                  "cache (STRATA_PREFILL_HELPER_SOURCE)\n");
         }
         strata::prefill::Prefill sp;
+        // TENSOR PARALLEL: rank 1's own prompt-prefill state (its weights, its session, its device), so both ranks
+        // read the prompt together and reduce the two half-sums - the fast batched path instead of the window loop.
+        strata::prefill::Prefill sp1;
+        bool sp1_valid = false;   // set once rank 1's batched prefill is up; the prompt path falls back to windows without it
         // the pool is idle while a prompt is read unless batch slots decode between its parts; with
         // STRATA_PREFILL_CPU_SHARE the staged-chunk limit before the chunk below sizes the loans (bytes_needed reads it)
         // #1607: Windows, the commit limit (RAM + page file) is what ends the engine silently; compare what this run plans
@@ -7606,7 +7820,17 @@ int main(int argc, char** argv) {
                 }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
-            if (share_pool) sp.set_cpu_pool(&pool);
+            // TENSOR PARALLEL: the prompt path must be the SAME on both ranks or their MoE diverges.  Rank 1's
+            // prefill (`sp1`) has no CPU pool, so if rank 0 kept one the two would compute the same experts in
+            // different engines - a deterministic divergence this work measured as non-finite logits (#879) at the
+            // end of a long prompt.  Both prefill paths are therefore GPU-only under --tp (measured: PP's prefill
+            // uses 141 CPU-seconds for 36k tokens, the pooled TP prefill 404 - the CPU was the bottleneck too).
+            if (share_pool && o.tp <= 0) sp.set_cpu_pool(&pool);
+            // TENSOR PARALLEL: both ranks' prompt prefill use the SAME residency table (`host_res`, rank 0's expert
+            // cache).  Rank 0 hits those resident experts through `xcache`, rank 1 through its own replica
+            // `tp1.xcache` (the same experts in the same slots) - so their MoE is symmetric AND served from the GPU
+            // cache (fast, like one card), not streamed from the host.  An earlier all-miss scheme made both ranks
+            // stream every expert, which was slow enough to trip the reduce's peer timeout on long prompts.
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
                          o.prefill_head_alias))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -7783,6 +8007,26 @@ int main(int argc, char** argv) {
         vh.blob = thits.blob;
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
         vh.n_slots = xcache.slots();
+        // STRATA_TP_NO_CACHE=1 (diagnostic): BOTH TP ranks run the all-pool tier, so the MoE is symmetric by
+        // construction (no residents anywhere; every expert comes from the shared pool).  Separates "the GPU
+        // hit path / cache replica is wrong" from "the pool or the shared expert is asymmetric".
+        if (o.tp > 0 && std::getenv("STRATA_TP_NO_CACHE") != nullptr) {
+            static uint8_t* nc_cache = nullptr;
+            static int32_t* nc_res = nullptr;
+            const size_t nres = (size_t) (g.n_layers * g.n_expert);
+            if (nc_cache == nullptr) {
+                (void) cudaMalloc((void**) &nc_cache, (size_t) 4 * 1024 * 1024);
+                (void) cudaMalloc((void**) &nc_res, nres * sizeof(int32_t));
+            }
+            std::vector<int32_t> none(nres, strata::core::kNotResident);
+            (void) cudaMemcpy(nc_res, none.data(), nres * sizeof(int32_t), cudaMemcpyHostToDevice);
+            vh.d_res = nc_res;
+            vh.h_res = nullptr;
+            vh.cache_base = nc_cache;
+            vh.n_slots = 1;
+            vh.blob = 4 * 1024 * 1024;
+            vh.slot_off = nullptr;
+        }
         // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
         // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
@@ -7939,12 +8183,219 @@ int main(int argc, char** argv) {
         }
         ver.set_remote_expert_opt(remote_opt.get());
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+        // TENSOR PARALLEL: this verifier is rank 0, and it has to SAY SO before `ver.init` carves its state and
+        // computes its head ranges - both derive from `tp_rank_current()`/`tp_ranks_current()`, whose default is
+        // "one rank holds the whole model".  Left at that default, this rank sizes a FULL geometry against tensors
+        // the loader has already cut in half: a deterministic wrong answer, and every per-rank dimension below is
+        // silently the geometry's own again.  Rank 1 says the same for itself in `TpRank::build` (tp_pair.hpp).
+        if (o.tp > 0 && !strata::core::tp_set_ranks(0, o.tp, err)) {
+            std::fprintf(stderr, "strata serve: --tp %d: %s\n", o.tp, err.c_str());
+            return 1;
+        }
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
+        }
+        // ---- TENSOR PARALLEL, rank 1 ---------------------------------------------------------------
+        // Rank 0 IS this context (`wt`/`ss`/`vh`/`ver` above were loaded from rank 0's plan when --tp
+        // asked for one).  Rank 1 gets its own shards, session, nominal expert tier and verifier, and the two
+        // meet on `tp_pair`'s collective from inside the window (`install` around each `run` below).
+        strata::program::TpRank tp1;
+        strata::kernels::ArPair tp_pair;
+        std::unique_ptr<strata::core::TpHostRuntime> tp_rt0, tp_rt1;
+        // RANK 1'S HEAD LIVES AS LONG AS THE RUN, NOT AS LONG AS THIS BLOCK.  `Verifier` keeps the head it was
+        // given as a RAW pointer (`verify.cpp`: `head_ = head`), and it dereferences it on every window
+        // (`head_ != nullptr && head_->loaded()`).  A head owned by the `if (o.tp > 0)` block below is destroyed
+        // when that block ends, so rank 1 read freed memory, the check failed, and the verifier fell back to the
+        // canonical `lm_head` - which resolves `output.weight` through a table where the head serves that tensor
+        // (0 bytes there) and refuses: `output.weight: the planes add up to 0 B but the tensor is 0 B`.
+        std::unique_ptr<strata::core::NativeHead> head1;
+        if (o.tp > 0) {
+            // THE SAME SKIP SET THE SINGLE-CARD LOAD BUILT, taken rather than rebuilt: a second rank is not a
+            // second engine.  A set rebuilt here (from `served_names` alone) drifts from the engine's own - the
+            // engine ERASES the PLE key from its set, because the PLE module validates its canonical key at
+            // construction and a native pack has none to load.
+            std::set<std::string> tp_skip = skip;
+            // ...BUT `output.weight` COMES OUT OF IT.  Rank 0 skips it because its head serves it; something on
+            // rank 1's window still asks for the WEIGHT's planes, and a skipped tensor has a 0-byte `WeightRef`,
+            // which `layer.cpp`'s `plane_ptrs` refuses:
+            //   `output.weight: the planes add up to 0 B but the tensor is 0 B - what the loader recorded is not
+            //    the layout that was loaded`.
+            // Rank 1 has its own head now, so it can also carry the canonical weight: correct beats one tensor
+            // short of a working rank.
+            tp_skip.erase("output.weight");
+            // THE HEAD IS PER RANK, AND IT HAS TO BE.  The shard table mirrors the head's weights, so each rank
+            // holds its own copy - and handing rank 1 the ENGINE's head, which lives on rank 0's card, made rank
+            // 1 read device 0's memory from device 1: measured on two cards as `verify: launch: an illegal memory
+            // access` (the same config without a head for rank 1 stopped faulting).  Loading a second head inside
+            // rank 1's device places every byte of it on the card that reads it.
+            // --tp-device: empty = the next visible card, "0" = both ranks on this one (the A/B)
+            // the device is this rank's, whether the early open reached it or not (the flow has branches that
+            // skip it, and `build` re-opens whatever it is given)
+            const int tp_dev1 = o.tp_device.empty() ? 1 : std::atoi(o.tp_device.c_str());
+            if (native_head.loaded()) {
+                head1 = std::make_unique<strata::core::NativeHead>();
+                const strata::program::OnTpDevice on_head1(tp_dev1);
+                const auto h1_t0 = std::chrono::steady_clock::now();
+                if (!head1->load(o.native_head_shards, g.n_embd, n_vocab, err)) {
+                    std::fprintf(stderr, "strata generate: --tp %d: rank 1's own head: %s\n", o.tp, err.c_str());
+                    return 1;
+                }
+                std::fprintf(stderr, "strata generate: --tp %d: rank 1's own head on CUDA%d, %llu bytes, in %.1f s\n",
+                             o.tp, tp_dev1, (unsigned long long) head1->weight_bytes(),
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - h1_t0).count());
+            }
+            if (!tp1.build(o.pack, o.native_shards, &tp_skip, g, o.max_context, ss.k, tp_dev1, /*which=*/1,
+                           /*how_many=*/2, head1 ? head1.get() : nullptr,
+                           batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err, &vh,
+                           xcache.valid() ? xcache.bytes() : 0, &sized_slots)) {
+                std::fprintf(stderr, "strata generate: --tp %d: %s\n", o.tp, err.c_str());
+                return 1;
+            }
+            // RANK 1'S PLE SESSION.  The engine wires its own above (this file:3497-3560 and the history at
+            // :4569) and rank 1's `ss.ple` was left EMPTY.  Measured on two cards, at EVERY layer:
+            //   rank 0  table=00000009488C6A48  key_bf16=0000001F1D068B00  hist=0000001FD01DAB00
+            //   rank 1  table=0000000000000000  key_bf16=0000000000000000  hist=0000000000000000
+            // so `ple.ready()` was false and the whole per-layer embedding was silently skipped on one rank - the
+            // two ranks ran two different models, which is the first divergence this work hunted (the write-back
+            // block of `pre(0)`) and the source of the garbled, non-deterministic output.
+            // Same tensors, looked up in RANK 1'S table and allocated on RANK 1'S card.  `consts`, `emb_host` and
+            // the file reader are host-side and genuinely shared (the gathers are serialised by a mutex).
+            if (ss.ple.table != nullptr && tp1.ss.ple.table == nullptr) {
+                const strata::program::OnTpDevice on_ple(tp_dev1);
+                strata::core::SessionState& s1 = tp1.ss;
+                const strata::core::WeightRef* wk = tp1.wt.find("blk.1.ple_key.weight");
+                const strata::core::WeightRef* wv = tp1.wt.find("blk.1.ple_value.weight");
+                const strata::core::WeightRef* wnk = tp1.wt.find("blk.1.ple_norm_key.weight");
+                const strata::core::WeightRef* wnq = tp1.wt.find("blk.1.ple_norm_query.weight");
+                const strata::core::WeightRef* wnc = tp1.wt.find("blk.1.ple_norm_conv.weight");
+                const strata::core::WeightRef* wc = tp1.wt.find("blk.1.ple_conv1d.weight");
+                if (wk == nullptr || wv == nullptr || wnk == nullptr || wnq == nullptr || wnc == nullptr ||
+                    wc == nullptr) {
+                    std::fprintf(stderr, "strata generate: --tp %d: rank 1's own PLE weights are missing\n", o.tp);
+                    return 1;
+                }
+                if (!wk->quantized()) s1.ple.w.key_bf16 = (const uint16_t*) wk->data;
+                else if (wk->data != nullptr) {
+                    s1.ple.w.key_codes = (const uint8_t*) wk->data;
+                    s1.ple.w.key_scales = (const float*) ((const uint8_t*) wk->data + wk->codes_bytes);
+                }
+                if (wk->native_data != nullptr) {
+                    s1.ple.w.key_native_data = wk->native_data;
+                    s1.ple.w.key_native_type = wk->native_type;
+                    s1.ple.w.key_native_q8_1 = wk->native_q8_1;
+                }
+                s1.ple.w.value_bf16 = (const uint16_t*) wv->data;
+                s1.ple.w.norm_key = (const float*) wnk->data;
+                s1.ple.w.norm_query = (const float*) wnq->data;
+                s1.ple.w.norm_conv = (const float*) wnc->data;
+                s1.ple.w.conv1d_f16 = (const uint16_t*) wc->data;
+                s1.ple.consts = ss.ple.consts;
+                s1.ple.table = (o.tp > 0 && ple_table1.rows() > 0) ? &ple_table1 : ss.ple.table;
+                s1.ple.token = &s1.ple_token;
+                s1.ple.prev = s1.ple_prev;
+                s1.ple.emb_host = ple_emb_host1.data();
+                void* e1 = nullptr;
+                void* sb1 = nullptr;
+                if (cudaMalloc(&e1, (size_t) strata::kernels::NG_N_EMBD * 4) != cudaSuccess ||
+                    cudaMalloc(&sb1, strata::core::ple_run_scratch_bytes()) != cudaSuccess) {
+                    std::fprintf(stderr, "strata generate: --tp %d: rank 1's PLE buffers failed\n", o.tp);
+                    return 1;
+                }
+                s1.ple.emb_dev = (float*) e1;
+                s1.ple.scratch = (float*) sb1;
+                s1.ple.hist = s1.ple_hist;
+                std::fprintf(stderr,
+                             "strata generate: --tp %d: rank 1's PLE wired (table=%p key_bf16=%p hist=%p ready=%d)\n",
+                             o.tp, (const void*) s1.ple.table, (const void*) s1.ple.w.key_bf16,
+                             (const void*) s1.ple.hist, (int) s1.ple.ready());
+            }
+            // RANK 1 DOES NOT SAMPLE.  Its output is discarded - the answer is rank 0's `outv` - so it runs no
+            // head work at all.  That also keeps it off the canonical `lm_head`, which resolves `output.weight`
+            // through the weight table: rank 1's head serves that tensor (the table's copy is skipped and 0 B),
+            // and `layer.cpp`'s `plane_ptrs` refuses a 0-byte tensor outright -
+            //   `output.weight: the planes add up to 0 B but the tensor is 0 B`.
+            tp1.ver.set_head_sampling(false);
+            int ord[2] = {0, tp1.dev};
+            // `ArPair::init` walks the pair and leaves the CURRENT DEVICE on the LAST rank's card, and this thread
+            // carries on doing rank 0's work: without this restore the engine issues rank 0's kernels and copies on
+            // the peer's device - measured on two cards as `verify: launch: an illegal memory access`.
+            // (`tp_allreduce_test` never sees it: every one of its operations sets the device explicitly.)
+            int prev_dev = 0;
+            (void) cudaGetDevice(&prev_dev);
+            // Bf16 WIRE, MEASURED BETTER THAN F32 ON THIS PAIR.  F32 was re-tested after rank 1's PLE session was wired
+            // (before that the two ranks ran different models, so the earlier F32 measurement proved nothing) and it
+            // came out WORSE: eight identical requests at temperature 0
+            //   Bf16  ['\n\n','We','The','The','The','用户','The','The']   4 distinct, 'We' x1
+            //   F32   ['9','用户','*','The','<|im_start|>','用户','\t','user']  7 distinct, no 'We'
+            // so Bf16 stays.  The all-reduce itself is not the weakness either: with the reduce slots recorded
+            // (TPDIAG L_redpair, verify.cpp's 200+l / 260+l) both ranks' post-reduce values agreed in 48 of 48
+            // (window, layer) pairs - the pair hands both ranks the same sum, and only the head/sampler side can
+            // turn that into a different token.
+            // A WINDOW, NOT A ROW.  The pair has to stage a whole group's rows: the two reduced contractions
+            // (`ssm_out` and `attn_output`) hand the peer `n` rows of `n_embd` each, and with the region sized for
+            // one row (`g.n_embd`) the calls below could only ever cover the group's FIRST row - the other n-1
+            // rows stayed this rank's partial sum.  The engine's own collective test sizes it exactly this way
+            // (`tests/core/tp_allreduce_test.cu`: `max_floats = kVerifyMaxT * n_embd`).
+            // MEASURED AND REVERTED (round 144): with the logprob channel in hand this was re-tested on the fixed engine,
+            // because the pair's first position differs from one card by ~0.06 nat on the same token (846: -0.885026
+            // against -0.821767).  F32 made it WORSE, not equal - position 0 moved to -0.887195 - so the wire is not
+            // the source of the divergence and the faster bf16 wire stays.  The per-position dump also shows the gap
+            // growing along the prefill and the top-1 token parting at position 3, i.e. a real computational
+            // difference from the very first position, not a rounding artefact.
+            if (!tp_pair.init(ord, std::max<int64_t>(strata::kernels::kVerifyMaxT, sp.chunk()) * g.n_embd, strata::kernels::ArWire::F32,
+                              strata::kernels::kArBlocks, err)) {
+                std::fprintf(stderr, "strata generate: --tp %d: %s\n", o.tp, err.c_str());
+                return 1;
+            }
+            strata::kernels::ar_debug_set_pair(&tp_pair);   // diagnostics: host readback of the staging
+
+            (void) cudaSetDevice(prev_dev);
+            tp_rt0 = std::make_unique<strata::core::TpHostRuntime>(&tp_pair, 0);
+            tp_rt1 = std::make_unique<strata::core::TpHostRuntime>(&tp_pair, 1);
+            // RANK 1'S OWN PROMPT-PREFILL STATE, built here (after its device is open and its weights loaded).  Both
+            // ranks then read the prompt together through `read_part` and the two half-sums reduce - the fast batched
+            // path.  It sees the same ALL-MISS residency as rank 0's `sp`, so their MoE is symmetric (every expert
+            // streams on both); a null cache is fine because an all-miss residency never dereferences one.
+            {
+                std::string sp1_e;
+                // RANK 1'S DEVICE MUST BE CURRENT HERE: the prefill captures its device from `cudaGetDevice` at init,
+                // and after the all-reduce's setup the current device is rank 0's - without this, rank 1's prompt
+                // prefill would allocate on (and upload its tokens to) the wrong card ("the token id upload failed").
+                const strata::program::OnTpDevice on_sp1_dev(tp1.dev);
+                // RANK 1 LENDS ITS OWN CACHE TAIL exactly as rank 0 does, so its prompt buffers take no extra VRAM
+                // (its card is full: the replicated expert cache + weights + K/V) and the two are symmetric - the
+                // same experts in the same slots are lent on both ranks and refilled after the prompt.  It joins
+                // `pf_parts` so the existing lend/refill machinery treats it as a second participant.
+                const int32_t l0 = pf_parts.empty() ? -1 : pf_parts[0].first;
+                void* borrow1 = nullptr;
+                uint64_t borrow_bytes1 = 0;
+                PfPart p1{&tp1.xcache, &tp1.ss, &sp1, tp1.dev, 0, g.n_layers, l0, -1, 0, {}};
+                if (l0 >= 0 && tp1.xcache.valid()) {
+                    borrow1 = (void*) tp1.xcache.device_slot(l0);
+                    borrow_bytes1 = part_bytes(p1, l0);
+                    p1.first_now = l0;
+                    pf_parts.push_back(p1);
+                }
+                // NOT fatal: if rank 1's batched-prefill state cannot be built the prompt falls back to the two-rank
+                // verify windows - correct, just slower.  It sees the SAME residency table as rank 0 (`host_res`), so
+                // both hit the same resident experts (rank 1 through its replica cache) - symmetric and GPU-fast.
+                if (sp1.init(tp1.wt, g, tp1.ss, prefill_src, &tp1.xcache, host_res.data(), sp.chunk(),
+                             tp1.stream, sp1_e, borrow1, borrow_bytes1, o.prefill_head_alias)) {
+                    sp1_valid = true;
+                    std::fprintf(stderr, "strata generate: --tp %d: rank 1's prompt prefill is up (chunk %lld -> %lld, "
+                                         "borrows %lld slots, %.2f GiB)\n",
+                                 o.tp, (long long) sp.chunk(), (long long) sp1.chunk(),
+                                 borrow1 != nullptr ? (long long) (tp1.xcache.slots() - l0) : 0,
+                                 (double) borrow_bytes1 / 1073741824.0);
+                } else {
+                    std::fprintf(stderr, "strata generate: --tp %d: rank 1's prompt prefill is not up (%s); "
+                                         "prompts read through the two-rank verify windows\n", o.tp, sp1_e.c_str());
+                }
+            }
         }
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
@@ -11224,10 +11675,17 @@ int main(int argc, char** argv) {
             static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
             int64_t req_short_read = o.short_read;   // STRATA_PIPELINE_SWITCH may set it per request (short_read=)
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
-                if (no_short || b - a > req_short_read) return false;
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
                         if (sp.embd_rows[i] != nullptr) return false;
+                // TENSOR PARALLEL: the batched prompt path computes the right numbers (936 t/s on 6856 tokens) but
+                // the KV it leaves behind is only readable by the decode for prompts whose cells all fall in page 0
+                // - measured: 66 tokens pass, 77 and up fail with non-finite logits in the window that consumes them,
+                // while the SAME prompts on one card read N of N and pass.  The two-rank verify windows are correct
+                // at every length (3458 tokens: 3458 of 3458 read), so they stay the DEFAULT and the batched path is
+                // opt-in until the batched append and the decode gather agree on one page stride.
+                if (o.tp > 0 && std::getenv("STRATA_TP_FASTPROMPT") == nullptr) return true;
+                if (no_short || b - a > req_short_read) return false;
                 return true;
             };
             // --pipeline-windows, testing: STRATA_PIPELINE_SWITCH=<file> is read at every request, "pw=<0|1|2>
@@ -11370,7 +11828,91 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
-                    if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
+                    if (o.tp > 0) {
+                        // TENSOR PARALLEL: THE PROMPT'S WINDOWS BELONG TO THE SAME COLLECTIVE SEQUENCE AS THE
+                        // DECODE'S.  The ranks rendezvous once per reduce, and the protocol's parity is "the same
+                        // parity for the same logical call", which holds only while BOTH ranks read the same
+                        // windows (`kernels/allreduce.hpp`).  Rank 0 read every prompt window here while rank 1
+                        // read none, so every later parity paired the two ranks' different windows and the whole
+                        // answer came out garbled - measured: rank 0 ran 11 windows, rank 1 ran 1.  Both ranks run
+                        // this window, exactly as the decode loop below runs its own.
+                        Drive drive1 = drive;
+                        // RANK 1 MUST DISPATCH AGAINST ITS OWN PLAN AND REPLICATED CACHE, not rank 0's.  `drive1 =
+                        // drive` copies the struct only, so its `plan` still names rank 0's `plan_sink()` and its
+                        // cache pointers rank 0's device arena: rank 1's dispatch then wrote rank 0's plan while
+                        // rank 1's kernel read its own (empty) one.  This is the shared-machinery race the pool
+                        // comment warns about; pointing drive1 at rank 1's own plan + cache makes both ranks
+                        // compute the same expert from the same bytes.
+                        drive1.d.plan = tp1.ver.plan_sink();
+                        if (tp1.vh.cache_base != nullptr) {
+                            drive1.d.cache_base = (const uint8_t*) tp1.vh.cache_base;
+                            drive1.d.cache_blob = tp1.vh.blob;
+                            drive1.d.cache_slot_off = tp1.vh.slot_off;
+                        }
+                        bool ran0 = false, ran1 = false;
+                        std::vector<int32_t> outw1(outw.size());
+                        std::string tp_e0, tp_e1, tp_rank_err;
+                        (void) strata::core::tp_set_ranks(0, o.tp, tp_rank_err);
+                        strata::core::TpRuntime::install(tp_rt0.get());
+                        std::thread tprank1([&] {
+                            const strata::core::OnDevice on(tp1.dev);
+                            std::string tp_rank_err1;
+                            (void) strata::core::tp_set_ranks(1, o.tp, tp_rank_err1);
+                            strata::core::TpRuntime::install(tp_rt1.get());
+                            // the same n-gram context on both ranks: the engine's `ple_prev` carries the
+                    // conversation's last tokens (conversation_state.cpp:192-193) and rank 1's session still
+                    // holds the -1s from session_init, so the PLE rows came out different.
+                    tp1.ss.ple_prev[0] = ss.ple_prev[0];
+                    tp1.ss.ple_prev[1] = ss.ple_prev[1];
+                    ran1 = tp1.ver.run(T, win.data(), q, win_pool_fn, &drive1, outw1.data(), tp_e1);
+                        });
+                        ran0 = ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), tp_e0);
+                        tprank1.join();
+                        strata::core::TpRuntime::install(nullptr);
+                        // RANK 1'S DISPATCH STATE IS NEVER CHECKED BY THE ENGINE, so a rank-1 expert failure is
+                        // silent - and a silent failure leaves the MoE's contribution out of `bo_`, which is exactly
+                        // the measured shape: rank 1's `bo_` at layer 1 is byte-identical with the experts skipped
+                        // and with them running (8.9005648 both times), while rank 0's moves with them.
+                        if (drive1.d.failed || drive1.d.fail != nullptr)
+                            std::fprintf(stderr, "TPDIAG rank1 dispatch FAILED: failed=%d layer=%lld fail=%s\n",
+                                         drive1.d.failed ? 1 : 0, (long long) drive1.d.fail_layer,
+                                         drive1.d.fail != nullptr ? drive1.d.fail : "(null)");
+                        else std::fprintf(stderr, "TPDIAG rank1 dispatch ok: calls=%lld\n", (long long) drive1.calls);
+                        if (!ran0 || !ran1 || drive.d.failed) {
+                            if (drive.d.failed && drive.d.fail) e = drive.d.fail;
+                            else if (!ran1) e = tp_e1;
+                            else e = tp_e0;
+                            return false;
+                        }
+                        // TENSOR PARALLEL: rank 1's session state must advance with every prompt window, or its
+                        // K/V and GDN state is reused for the wrong positions and every reduce after the first
+                        // window pairs rank 0's correct partial with rank 1's stale partial.
+                        if (!tp1.ver.commit(T, tp_e1) || !tp1.ver.wait_commit(tp_e1)) {
+                            e = tp_e1;
+                            return false;
+                        }
+                        // TPDIAG: compare the residual each rank will feed into the next window (STRATA_TP_RPOST=1).
+                        if (std::getenv("STRATA_TP_RPOST") != nullptr) {
+                            const int64_t hc = g.hc, N = g.n_embd;
+                            const size_t dn = (size_t) T * (size_t) hc * (size_t) N;
+                            std::vector<float> h((size_t) dn);
+                            for (int rd = 0; rd < 2; ++rd) {
+                                strata::core::Verifier& v = (rd == 0 ? ver : tp1.ver);
+                                int d = v.device();
+                                (void) cudaSetDevice(d);
+                                const float* R = v.final_R_all();
+                                double s = 0.0, s2 = 0.0;
+                                if (R != nullptr && cudaMemcpy(h.data(), R, dn * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
+                                    for (size_t i = 0; i < dn; ++i) { const double x = h[i]; s += x; s2 += x * x; }
+                                }
+                                std::fprintf(stderr, "TPDIAG Rpost win=%lld rank=%d dev=%d sum=%.9g sumsq=%.9g v0=%.9g\n",
+                                             (long long) q + T, rd, d, s, s2, R != nullptr ? (double) h[0] : 0.0);
+                            }
+                            int prev = -1;
+                            (void) cudaGetDevice(&prev);
+                            (void) cudaSetDevice(prev);
+                        }
+                    } else if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
                     }
@@ -11398,7 +11940,7 @@ int main(int argc, char** argv) {
                     pp_exact = true;
                 }
                 // the batched prompt path (other streams), checkpoints and snapshots may follow: the last commit first
-                if (!ver.wait_commit(e)) return false;
+                if (!ver.wait_commit(e) || (o.tp > 0 && !tp1.ver.wait_commit(e))) return false;
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
@@ -11578,11 +12120,42 @@ int main(int argc, char** argv) {
                 }();
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
                 const int64_t piece = strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C, yield_chunks);
-                if (piece <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                // TENSOR PARALLEL: one prompt chunk runs on BOTH ranks at once (each its own half of the projections,
+                // reduced inside the prefill's two output GEMMs).  This is the fast batched path - the same one the
+                // single card takes - so a long prompt prefills at GEMM speed instead of one 6-token window at a time.
+                auto run_chunk = [&](int64_t q, int64_t n, int64_t pos0, std::string& e) -> bool {
+                    if (o.tp <= 0) return sp.run(ids.data() + q, n, pos0, e);
+                    std::string e1;
+                    std::thread t1([&] {
+                        const strata::core::OnDevice on(tp1.dev);
+                        std::string rk;
+                        (void) strata::core::tp_set_ranks(1, o.tp, rk);
+                        strata::core::TpRuntime::install(tp_rt1.get());
+                        if (!sp1.run(ids.data() + q, n, pos0, e1)) {
+                            strata::core::TpRuntime::install(nullptr);
+                            return;
+                        }
+                        strata::core::TpRuntime::install(nullptr);
+                    });
+                    std::string rk0;
+                    (void) strata::core::tp_set_ranks(0, o.tp, rk0);
+                    strata::core::TpRuntime::install(tp_rt0.get());
+                    const bool ok0 = sp.run(ids.data() + q, n, pos0, e);
+                    t1.join();
+                    strata::core::TpRuntime::install(nullptr);
+                    // Surface rank 1's own error too: if it stopped early (fewer reduces), rank 0's reduce is the one
+                    // that reports "gave up waiting", which hides the real cause.
+                    if (!e1.empty()) {
+                        std::fprintf(stderr, "strata tp: rank 1's prompt prefill failed: %s\n", e1.c_str());
+                        if (e.empty()) e = "rank 1's prompt prefill: " + e1;
+                    }
+                    return ok0 && e1.empty();
+                };
+                if (piece <= 0) return run_chunk(a0, b0 - a0, a0, e);
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + piece);
                     const auto tq = Clock::now();
-                    if (!sp.run(ids.data() + q, r - q, q, e)) return false;
+                    if (!run_chunk(q, r - q, q, e)) return false;
                     q = r;
                     if (q >= b0) continue;
                     int ys = -1;
@@ -12654,7 +13227,54 @@ int main(int argc, char** argv) {
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
-                if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
+                // TENSOR PARALLEL: the two ranks run the SAME window on TWO THREADS at once.  The in-kernel
+                // handshake is BLOCKING (a rank's reduce spins until the peer's half arrives), so running them
+                // one after the other makes the first rank give up (~20 ms) before the second is even enqueued.
+                // Each thread's `TpRuntime::install` is thread-local, which is what keeps rank 0's reduces on
+                // `tp_rt0` and rank 1's on `tp_rt1`.
+                bool ran0 = false, ran1 = true;
+                std::string tp_err0, tp_err1;
+                std::vector<int32_t> outv1((size_t) T);
+                if (o.tp > 0) {
+                    // rank 1 gets its OWN pool state: a copy of `drive` with the same read-only cache pointers
+                    // but separate counters and `d.layers` - the two ranks run at once, and a shared Drive races
+                    // on those.  The expert cache itself is read-only during decode, so sharing the pointers is
+                    // safe (the experts are not split; P2 will give each rank its own).
+                    Drive drive1 = drive;
+                    // RANK 1 DISPATCHES AGAINST ITS OWN PLAN AND REPLICATED CACHE (see read_windows): `drive1 =
+                    // drive` copies the struct only, so without this its plan and cache name rank 0's.
+                    drive1.d.plan = tp1.ver.plan_sink();
+                    if (tp1.vh.cache_base != nullptr) {
+                        drive1.d.cache_base = (const uint8_t*) tp1.vh.cache_base;
+                        drive1.d.cache_blob = tp1.vh.blob;
+                        drive1.d.cache_slot_off = tp1.vh.slot_off;
+                    }
+                    std::string tp_rank_err;
+                    // The RANK is thread-local too (`shard.hpp`): every per-rank dimension the window reads -
+                    // its head ranges, its staging - comes from here, so each thread says which rank it is.
+                    (void) strata::core::tp_set_ranks(0, o.tp, tp_rank_err);
+                    strata::core::TpRuntime::install(tp_rt0.get());   // THIS thread is rank 0
+                    std::thread tprank1([&] {
+                        const strata::core::OnDevice on(tp1.dev);   // rank 1's kernels run on its own card
+                        std::string tp_rank_err1;
+                        (void) strata::core::tp_set_ranks(1, o.tp, tp_rank_err1);
+                        strata::core::TpRuntime::install(tp_rt1.get());
+                        // the same n-gram context on both ranks: the engine's `ple_prev` carries the
+                    // conversation's last tokens (conversation_state.cpp:192-193) and rank 1's session still
+                    // holds the -1s from session_init, so the PLE rows came out different.
+                    tp1.ss.ple_prev[0] = ss.ple_prev[0];
+                    tp1.ss.ple_prev[1] = ss.ple_prev[1];
+                    ran1 = tp1.ver.run(T, window.data(), p, win_pool_fn, &drive1, outv1.data(), tp_err1);
+                    });
+                    ran0 = ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), tp_err0);
+                    tprank1.join();
+                    strata::core::TpRuntime::install(nullptr);
+                    if (!ran0) err = tp_err0;
+                    if (!ran1) err = tp_err1;
+                } else {
+                    ran0 = ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err);
+                }
+                if (!ran0 || !ran1 || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
@@ -12690,6 +13310,11 @@ int main(int argc, char** argv) {
                 if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
                 if (!ver.commit(a + 1, err)) {
+                    if (adapt_thr.joinable()) adapt_thr.join();
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+                if (o.tp > 0 && (!tp1.ver.commit(a + 1, err) || !tp1.ver.wait_commit(err))) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
