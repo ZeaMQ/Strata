@@ -3,8 +3,9 @@
 **Based on:** Strata **0.1.44.1**, commit **`296b59d2`** (2026-10-14), CUDA source build, Windows.
 Everything below was measured on that tree; a different base commit may not apply cleanly.
 
-**Provenance:** produced with AI assistance over several long sessions, **not human-reviewed**. The fast path
-described in 4 stayed unsolved through thirteen separate fix attempts. Treat it as a bug report with a patch
+**Provenance:** produced with AI assistance in one long session that ran **over 400 assistant turns and
+4 000 tool steps** (the session's own counters), **not human-reviewed**. The fast path described in 4 stayed
+unsolved through thirteen separate fix attempts. Treat it as a bug report with a patch
 attached, not as a submission.
 
 **Status:半成品 / half-finished.** A dual-GPU tensor-parallel path exists and is *correct* for every

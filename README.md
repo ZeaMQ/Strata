@@ -29,8 +29,9 @@
 >   [#156](https://github.com/Niko1221/Strata/issues/156) (closed as not planned; the measurements here
 >   support that decision)
 >
-> **Provenance:** AI-assisted over several long sessions, **not human-reviewed**; the fast path stayed unsolved
-> through **13** separate fix attempts. Only CUDA was built — HIP and SYCL are unverified.
+> **Provenance:** AI-assisted in one long session that ran **over 400 assistant turns and 4 000 tool steps**
+> (the session's own counters), **not human-reviewed**; the fast path stayed unsolved through **13** separate
+> fix attempts. Only CUDA was built — HIP and SYCL are unverified.
 >
 > ---
 >
