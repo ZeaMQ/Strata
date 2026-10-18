@@ -1,3 +1,38 @@
+> ### 这是一个 fork，不是 Strata 本体
+>
+> 它只为一件事存在：交接一个未完成的实验——两张 RTX 3080 上的张量并行（`--tp 2`）。
+> **它不可用**：能跑通的那条路径约为现有层切分 prefill 吞吐的 **2%**，快速路径还会产生非有限 logits。
+> 分支 `tp2-wip` 是 `296b59d2`（引擎 0.1.44.1）之上的一次提交；上游项目在
+> [Niko1221/Strata](https://github.com/Niko1221/Strata)。
+>
+> **先读交接文档：[/docs/TP2-HANDOVER.zh-CN.md](docs/TP2-HANDOVER.zh-CN.md)（中文）· [/docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md)（English）**
+>
+> 差异：[main...tp2-wip](https://github.com/ZeaMQ/Strata/compare/main...tp2-wip)。
+> 相关上游 issue：[#156](https://github.com/Niko1221/Strata/issues/156)（当年以"暂不计划"关闭，
+> 本交接里的实测支持那个判断）、[#3025](https://github.com/Niko1221/Strata/issues/3025)（本交接，已由我关闭）。
+>
+> ---
+>
+> ### This is a fork, not Strata
+>
+> It exists to hand over one unfinished experiment: tensor parallel (`--tp 2`) on two RTX 3080s.
+> **It is not usable** — the one working path is about **2%** of the existing layer split's prompt
+> throughput, and its fast path produces non-finite logits. Branch `tp2-wip` is one commit on top of
+> `296b59d2` (engine 0.1.44.1); the upstream project is
+> [Niko1221/Strata](https://github.com/Niko1221/Strata).
+>
+> **Read [/docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md) (English) or
+> [/docs/TP2-HANDOVER.zh-CN.md](docs/TP2-HANDOVER.zh-CN.md) (中文) first.**
+>
+> Diff: [main...tp2-wip](https://github.com/ZeaMQ/Strata/compare/main...tp2-wip).
+> Upstream issues: [#156](https://github.com/Niko1221/Strata/issues/156) (closed as not planned; the
+> measurements here support that decision) and [#3025](https://github.com/Niko1221/Strata/issues/3025)
+> (this handover, closed by me).
+>
+> ---
+>
+> Everything below is upstream's README, unchanged.
+
 <h1 align="center">Strata</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
