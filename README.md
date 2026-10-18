@@ -1,37 +1,36 @@
-> # 这是一个 fork，不是 Strata 本体
+> # This is a fork, not Strata
 >
-> 只为一件事存在：交接一个**未完成、不可用**的实验——两张 RTX 3080 上的张量并行 `--tp 2`。
-> 分支 `tp2-wip` 基于 `296b59d2`（引擎 **0.1.44.1**）；上游项目在
-> [Niko1221/Strata](https://github.com/Niko1221/Strata)。
+> It exists for one thing: handing over an unfinished, **not usable** experiment — tensor parallel (`--tp 2`)
+> on two RTX 3080s. Branch `tp2-wip`, on top of `296b59d2` (engine **0.1.44.1**). Upstream is
+> [Niko1221/Strata](https://github.com/Niko1221/Strata).
 >
-> ## 速度（唯一需要记住的一张表）
+> 中文版本：[README.zh-CN.md](README.zh-CN.md)
 >
-> | 路径 | prefill | 状态 |
+> ## Speed (the one table worth remembering)
+>
+> | path | prefill | status |
 > |---|---|---|
-> | batched 快路径（`STRATA_TP_FASTPROMPT=1`） | **860–990 tok/s**（峰值 1012） | ❌ 读完 N−5 个 token 后产生非有限 logits，**不可用** |
-> | verify 窗口路径（**默认**） | **37–52 tok/s** | ✅ 全长度正确 |
-> | 层切分（原版 PP） | **2900+**（作者实测）／ 2114.8（本报告 36 329 token） | ✅ 目标 |
-> | 单卡（同一条 3 458-token prompt） | 397 tok/s | — |
+> | batched fast path (`STRATA_TP_FASTPROMPT=1`) | **860–990 tok/s** (peak 1012) | ❌ non-finite logits after N−5 tokens, **not usable** |
+> | verify windows (**default**) | **37–52 tok/s** | ✅ correct at every length measured |
+> | layer split (original PP) | **2900+** (author's runs) / 2114.8 (this report, 36 329 tokens) | ✅ the target |
+> | one card (same 3 458-token prompt) | 397 tok/s | — |
 >
-> **能用的路径只有层切分的约 2%；~990 tok/s 只等于一张卡的产出，第二张卡在 prefill 上几乎没被用上。**
+> **The usable path is about 2% of the layer split. ~990 tok/s is one card's worth of work — the second card
+> buys almost nothing on prefill.**
 >
-> ## 细节全在文档里
+> ## Details live in the documents
 >
-> - **中文完整版：[docs/TP2-HANDOVER.zh-CN.md](docs/TP2-HANDOVER.zh-CN.md)** — 可复现的实测数据、
->   完整证据链、13 项已排除假设、两阶段方案（990 → 2900 的算术）、两个真 bug、未测项、接手三步
-> - English: [docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md)
-> - 代码差异：[main...tp2-wip](https://github.com/ZeaMQ/Strata/compare/main...tp2-wip)（39 个文件）
-> - 上游 issue：[#3025](https://github.com/Niko1221/Strata/issues/3025)（本交接，已关闭）、
->   [#156](https://github.com/Niko1221/Strata/issues/156)（当年以"暂不计划"关闭，本交接的实测支持那个判断）
+> - **English handover: [docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md)** — reproducible measurements, the full
+>   evidence chain, the 13 rejected hypotheses, the two-stage plan (990 → 2900 arithmetic), the two real bugs,
+>   what was not tested, and the three steps to resume
+> - 中文完整版: [docs/TP2-HANDOVER.zh-CN.md](docs/TP2-HANDOVER.zh-CN.md)
+> - diff: [main...tp2-wip](https://github.com/ZeaMQ/Strata/compare/main...tp2-wip) (39 files)
+> - upstream issues: [#3025](https://github.com/Niko1221/Strata/issues/3025) (this handover, closed) ·
+>   [#156](https://github.com/Niko1221/Strata/issues/156) (closed as not planned; the measurements here
+>   support that decision)
 >
-> **来源：** AI 辅助、跨多次长时间会话完成，**未经人工 review**；快速路径经过 **13 次**独立修复尝试仍未解决。
-> 只编过 CUDA，未验证 HIP / SYCL。
->
-> ---
->
-> **Fork, not Strata.** An unfinished, **not usable** tensor-parallel (`--tp 2`) experiment on 2x RTX 3080.
-> The path that works runs at 37–52 tok/s — about 2% of the layer split; the ~990 tok/s path produces
-> non-finite logits. Not human-reviewed. Details in [docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md).
+> **Provenance:** AI-assisted over several long sessions, **not human-reviewed**; the fast path stayed unsolved
+> through **13** separate fix attempts. Only CUDA was built — HIP and SYCL are unverified.
 >
 > ---
 >
