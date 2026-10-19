@@ -48,17 +48,35 @@ the path I would use; the verify windows stay the default and the safe fallback.
 **Correction the same day — equal-length comparison.** The "~1.5 K vs 2.1–2.9 K" gap quoted above compared
 different prompt lengths. Running the SAME documents through both paths on this machine (warm expert cache,
 `max_tokens=1`, client-side wall clock, 2026-10-19): ~11.7k tokens TP 1 510–1 520 vs PP 1 519–1 535;
-24.8k TP 1 907 vs PP 1 904; 123.6k TP **2 994** vs PP **2 987**. The fixed fast path MATCHES the layer
-split at every length measured, and the author's 2900+ is the long-context end of the same rising curve
-(both paths: ~1 s fixed per-request cost amortizes and the expert cache warms across chunks). `nvidia-smi
-dmon -s t` during the 123.6k run: 4–7 GB/s mean per card (Rx+Tx), ~22 GB/s peak bursts — PCIe is not
-saturated. The shared ceiling is the host-side expert pipeline (grouping + streaming), which is why the two
-schemes converge; the stage-2 "halve the expert work" analysis in 4a explains why TP cannot BEAT the split,
-not why it was slower — it is not. Decode: TP ~90 vs PP ~99 tok/s.
+24.8k TP 1 907 vs PP 1 904; 123.6k TP **2 994 / 3 027** vs PP **2 987 / 3 046** (two runs each); 380k TP
+**2 993** vs PP **2 941** (after a warm ladder, see 0b). The fixed fast path MATCHES the layer split at
+every length measured, and the author's 2900+ is the long-context end of the same rising curve (both paths:
+~1 s fixed per-request cost amortizes and the expert cache warms across chunks) — a live observation of
+3 248 tok/s at 380k+ on the split agrees. `nvidia-smi dmon -s t` during the 123.6k run: 4–7 GB/s mean per
+card (Rx+Tx), ~22 GB/s peak bursts — PCIe is not saturated. The shared ceiling is the host-side expert
+pipeline (grouping + streaming), which is why the two schemes converge; the stage-2 "halve the expert work"
+analysis in 4a explains why TP cannot BEAT the split, not why it was slower — it is not. Decode: see 0a's
+matrix (TP ≈ PP ≈ 1.55x single card at every valid setting).
+
+## 0b. Cold long-context prefill: TP needs a warm ladder, the split does not (open)
+
+fixtest11 measured TP at 380k with a two-run protocol (380k warmup, then a different 380k doc): BOTH runs
+took 272/274 s — 1 385 tok/s, and the second run did not warm at all. The split under the same protocol:
+270 s then **129 s** — it converges after one pass. fixtest12 ran TP through a 36k → 124k → 380k ladder
+instead: 380k then took **126.9 s (2 993 tok/s)**, full parity. So the 1 385 was not a length cliff — it is
+a WARM-UP asymmetry, and it is real and reproducible, not noise.
+
+Leading hypothesis (not proven): the auto expert cache sizes the same 6 338 slots per card either way, but
+TP spreads them over all 48 layers (**132 experts/layer**) while the split gives each stage 24 layers
+(**264/layer**). A 380k-token document routes to nearly the whole 512-expert set per layer, so TP's cold
+hit rate is roughly half the split's and it keeps streaming; a shorter ladder first pins the document
+family's hot set. What was NOT tested: three back-to-back 380k runs on TP (does it converge eventually?),
+cache sizes forced equal per layer, and whether a bigger `--expert-cache` cap closes the gap. If you pick
+this up, that is the first experiment.
 
 ## 0a. One latent bug found while probing the ceiling
 
-The N-5 defect is NOT fully dead - the default settings hide it, two switches expose it:
+The N-5 defect is NOT fully dead - the default settings hide it, four switches expose it:
 
 - `--pool-workers 5` (instead of 11): reproduced `non-finite logits (#879) at position N-5` three runs in a row.
 - `--adapt-async 1`: reproduced it DETERMINISTICALLY (4 requests in a row, both ranks, positions 110-111 of a
@@ -66,21 +84,29 @@ The N-5 defect is NOT fully dead - the default settings hide it, two switches ex
   asynchronous tier's PRESENCE (its exchange buffers / wait flags / extra allocations), not the swapping.
   The gate accepts `--adapt-async` under TP (`adaptive tier asynchronous ... arena: copy-in only`) - do not
   use it on a TP build until this is understood.
+- `--spec 4` WITHOUT `--mtp` (suffix drafter): reproduced it 2/2 (78-token prompt, position 73, row 0; that
+  boot's cache was 6 424 slots - no draft head). So the no-MTP decode path cannot be measured on TP at all
+  until this is fixed.
 - Once, with the DEFAULT settings, the very first post-boot request that ran a decode (112-token prompt,
   512 generated) hit #879 twice and returned 503; the next boot's first such request was clean, and a retry
   after the 503 always succeeded. So the exposure is timing/memory-layout sensitive, not worker-count
   specific.
 
-Decode depends strongly on context length. At 180k context with 3000 generated tokens (pt=180 127, streamed,
-per-250-token buckets) TP median **94.1** / min 85.4 / max 100.9 vs PP **95.5** / 84.9 / 103.7 - a match,
-distributions overlapping. On the counting task (1→300, pt=78, ct=2048) TP **194.4** / 119 / 220 vs PP
-**191.3** / 116 / 220 - also a match, both reach 300 correctly. The author's 99.3 is the split at 36k - the
-same curve. One regime is NOT settled: on the short explanatory prompt, the slope method measured TP
-**140-155** (two warmed samples) vs PP **191.8** (one sample, and its 64-token endpoint was the first
-request after boot, which biases the PP figure UP). So short-context prose decode is the one place where
-TP measured below the split, on thin evidence - re-measure both sides warmed before believing either
-number. The max of ~220 is MTP at full acceptance on
-a counting sequence; the min is the thinking-to-answer transition. First-request decode after boot pays
+Decode, short context (count 1→300, streamed, per-250-token buckets), spec 4 + MTP: TP **196.4** vs PP
+**188.1** vs single card **123.3** - TP ≈ PP ≈ 1.55x one card (the ~220 max is MTP at full acceptance on a
+counting sequence; the ~116 min is the thinking-to-answer transition). Without MTP (suffix drafter): PP
+drops to **73.5**, TP cannot run (N-5 above). `--spec 0` is INVALID on this native IQ pack (the engine
+requires `--spec T (T >= 2)` and falls back to a different mode - the spec-0 numbers measured that fallback,
+not native decode). The "PP wastes half on bubbles" intuition is wrong in steady state: the split overlaps
+consecutive windows (and, at spec 0, consecutive tokens) across stages, so it gets the same ~1.5x as TP.
+
+At 180k context with 3000 generated tokens (pt=180 127, streamed, per-250-token buckets) TP median **94.1**
+/ min 85.4 / max 100.9 vs PP **95.5** / 84.9 / 103.7 - a match, distributions overlapping; the author's
+99.3 is the split at 36k - the same curve. One regime is NOT settled: on the short explanatory prompt, the
+slope method measured TP **140-155** (two warmed samples) vs PP **191.8** (one sample, and its 64-token
+endpoint was the first request after boot, which biases the PP figure UP). So short-context prose decode is
+the one place where TP measured below the split, on thin evidence - re-measure both sides warmed before
+believing either number. First-request decode after boot pays
 ~120 s of window graph capture, and the first large prompt pays ~90-140 s of prefill-graph capture - more
 on the TP build than on the split, which is why first-request wall times differ (228.9 s vs 90.6 s at
 180k+3000) while the warm steady state matches (fixtest7: 2 994 vs 2 987 at 123.6k). Not investigated

@@ -20,14 +20,20 @@
 > |---|---|---|
 > | ~11.7k tokens | 1 510–1 520 tok/s | 1 519–1 535 tok/s |
 > | 24.8k tokens | 1 907 tok/s | 1 904 tok/s |
-> | 123.6k tokens | **2 994 tok/s** | **2 987 tok/s** |
+> | 123.6k tokens | **2 994 / 3 027 tok/s** (two runs) | **2 987 / 3 046 tok/s** (two runs) |
+> | 380k tokens | **2 993 tok/s** (warm ladder) | **2 941 tok/s** |
 >
 > Prefill speed RISES with prompt length on both paths (a ~1 s fixed per-request cost amortizes and the
 > expert cache warms across chunks) — every earlier "TP is slower" number in this document's history
-> compared different lengths; the author's 2900+ is the long-context end of the same curve. PCIe is not
-> the limit: `nvidia-smi dmon -s t` during the 123.6k run gives 4–7 GB/s mean per card (Rx+Tx) against
-> ~22 GB/s peak bursts. The shared ceiling is the host-side expert pipeline (grouping + streaming), which
-> is why the two schemes converge. Decode depends strongly on context length. TP matches the split at
+> compared different lengths; the author's 2900+ is the long-context end of the same curve (a live
+> observation of 3 248 tok/s at 380k+ agrees). PCIe is not the limit: `nvidia-smi dmon -s t` during the
+> 123.6k run gives 4–7 GB/s mean per card (Rx+Tx) against ~22 GB/s peak bursts. The shared ceiling is the
+> host-side expert pipeline (grouping + streaming), which is why the two schemes converge. One asymmetry
+> is open (handover 0b): a COLD 380k prefill is ~2x slower on TP than on PP - TP's 6 338 cache slots
+> spread over 48 layers (132/layer) against the split's 24 (264/layer) - and two back-to-back cold 380k
+> runs did not warm TP, while a 36k→124k→380k ladder fully did.
+>
+> Decode depends strongly on context length. TP matches the split at
 > 180k context (streamed, 250-token buckets: TP median **94.1** vs PP **95.5**, min/max within 2%) and on
 > the counting task 1→300 (TP **194** vs PP **191**, both correct). The author's 99.3 is the split at 36k -
 > the same curve. One regime is unsettled: short-context prose decode measured TP 140-155 vs PP 191.8 on
