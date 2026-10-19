@@ -10,6 +10,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/tp/dims.hpp"   // the per-rank GDN counts: gdn_v_heads_rank / gdn_channels_rank
 
 #include <cuda_runtime.h>
 
@@ -36,18 +37,12 @@ constexpr uint64_t SESSION_STATE_ALIGN = 256;
 
 uint64_t align_up(uint64_t n, uint64_t a) { return (n + a - 1) / a * a; }
 
+using strata::tp::gdn_v_heads_rank;   // the one home: include/strata/tp/dims.hpp
+using strata::tp::gdn_channels_rank;
+
 /// The floats one GDN layer's recurrent + conv state needs.  `gdn_buffers_bytes` carves them for ONE layer and
 /// `GdnBuffers::state`/`conv_state` point INTO that carve, so a session with 36 GDN layers has to give each one
 /// its own - they cannot share, because the recurrence is the whole point.
-inline int64_t gdn_v_heads_rank(const ModelGeometry& g) {
-    const int64_t r = (int64_t) strata::core::tp_ranks_current();
-    return r > 0 ? g.ssm_v_heads / r : g.ssm_v_heads;
-}
-inline int64_t gdn_channels_rank(const ModelGeometry& g) {
-    const int64_t r = (int64_t) strata::core::tp_ranks_current();
-    return r > 0 ? g.ssm_conv_channels / r : g.ssm_conv_channels;
-}
-
 uint64_t gdn_state_floats(const ModelGeometry& g) {
     return (uint64_t) g.ssm_state_size * gdn_v_heads_rank(g) * g.ssm_state_size +
            (uint64_t) gdn_channels_rank(g) * (g.ssm_d_conv - 1);

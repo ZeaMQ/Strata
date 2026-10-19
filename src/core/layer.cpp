@@ -2,6 +2,7 @@
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
 #include "strata/core/tp_runtime.hpp"   // the owed all-reduce of a tensor-parallel rank (null on one card)
+#include "strata/tp/dims.hpp"           // qsa_shapes_rank: the per-rank QSA shapes (the one home)
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -551,17 +552,7 @@ bool moe_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 if (!moe_route(tables, g, layer, k, b, x, stream, err, db)) return false;    return moe_finish(tables, g, layer, k, b, x, parts, out, stream, err);}
 // ================================ the QSA mixer ================================
 namespace {using strata::kernels::QsaIndexerBuffers;using strata::kernels::QsaShapes;
-/// TENSOR PARALLEL: a QSA rank holds its OWN attention heads (and its own slice of the indexer's queries), so
-/// every shape below is the per-rank one.  `tp_ranks_current()` is 1 on a single-card run.
-inline QsaShapes qsa_shapes_rank(const ModelGeometry& g) {
-    QsaShapes s = qsa_shapes(g);
-    const int64_t tpr = (int64_t) strata::core::tp_ranks_current();
-    if (tpr > 1) {
-        s.n_head = (int) ((int64_t) g.n_head / tpr);
-        s.n_head_kv = (int) ((int64_t) g.n_head_kv / tpr);
-    }
-    return s;
-}
+using strata::tp::qsa_shapes_rank;   // the one home: include/strata/tp/dims.hpp
 /// `qsa_shapes(g)` (layout.hpp): the geometry the QSA kernels want, every field from the model's geometry
 uint64_t align_up16(uint64_t n) { return (n + 15) & ~15ull; }
 /// One cursor over an arena, so every region is 16-byte aligned without a list of hand-added offsets.

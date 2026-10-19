@@ -28,6 +28,7 @@
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/core/layer.hpp"
+#include "strata/tp/dims.hpp"   // the per-rank GDN/QSA counts: gdn_*_rank
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -2085,17 +2086,11 @@ struct PeTimer {
 };
 }  // namespace
 
-// THE GDN STATE'S PER-RANK DIMENSIONS.  session.cpp's `gdn_state_floats` and the strides here and in
-// verify.cpp must all use the same counts; the tensor-parallel work left them on the model's global ones,
-// where they agreed with each other and hid the omission.  Both are the identity on one card.
-static inline int64_t gdn_v_heads_rank(const strata::core::ModelGeometry& g) {
-    const int64_t r = (int64_t) strata::core::tp_ranks_current();
-    return r > 0 ? g.ssm_v_heads / r : g.ssm_v_heads;
-}
-static inline int64_t gdn_channels_rank(const strata::core::ModelGeometry& g) {
-    const int64_t r = (int64_t) strata::core::tp_ranks_current();
-    return r > 0 ? g.ssm_conv_channels / r : g.ssm_conv_channels;
-}
+// THE GDN STATE'S PER-RANK DIMENSIONS: include/strata/tp/dims.hpp, the one home (see the KV page-stride bug,
+// docs/TP2-HANDOVER.md section 0, for what happens when a second copy drifts).
+using strata::tp::gdn_v_heads_rank;
+using strata::tp::gdn_channels_rank;
+using strata::tp::gdn_k_heads_rank;
 
 // STRATA_DBG_GDN=1: which step of the GDN block first holds a non-finite value.  STRATA_DBG_NAN only checks the
 // MoE, which is downstream of the block that actually goes bad, so this is the probe that localises it.
@@ -2114,11 +2109,6 @@ static void dbg_gdn(int64_t layer, const char* what, const float* d, int64_t n, 
     }
     if (c) std::fprintf(stderr, "strata dbg gdn: layer %lld %-14s %lld of %lld non-finite (max |x| %.4g)\n",
                         (long long) layer, what, (long long) c, (long long) k, mx);
-}
-
-static inline int64_t gdn_k_heads_rank(const strata::core::ModelGeometry& g) {
-    const int64_t r = (int64_t) strata::core::tp_ranks_current();
-    return r > 0 ? g.ssm_k_heads / r : g.ssm_k_heads;
 }
 
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {

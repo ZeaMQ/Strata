@@ -2,6 +2,7 @@
 #include "strata/core/batch_rows.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/tp_runtime.hpp"   // the all-reduce a tensor-parallel rank owes (null on one card)
+#include "strata/tp/dims.hpp"           // the per-rank GDN counts: gdn_v_heads_rank / gdn_channels_rank
 #include "strata/core/verify.hpp"
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 #include "strata/core/host_graph_launch.hpp"
@@ -82,18 +83,8 @@ bool window_copy_logits(void* w, int t, float* host);
 #endif
 
 namespace strata::core {
-// THE GDN STATE'S PER-RANK DIMENSIONS.  The tensor-parallel work made the GDN scratch per-rank
-// (`gdn_buffers_bytes`) but left the session state, and every stride into it, on the model's global
-// counts - which agreed with each other and so looked self-consistent while disagreeing with the
-// intent.  Both return the geometry's own values on one card, so the default path is untouched.
-inline int64_t gdn_v_heads_rank(const ModelGeometry& g) {
-    const int64_t r = (int64_t) strata::core::tp_ranks_current();
-    return r > 0 ? g.ssm_v_heads / r : g.ssm_v_heads;
-}
-inline int64_t gdn_channels_rank(const ModelGeometry& g) {
-    const int64_t r = (int64_t) strata::core::tp_ranks_current();
-    return r > 0 ? g.ssm_conv_channels / r : g.ssm_conv_channels;
-}
+using strata::tp::gdn_v_heads_rank;   // the one home: include/strata/tp/dims.hpp
+using strata::tp::gdn_channels_rank;
 
 namespace {
 /// TPDIAG (temporary): see the note at the layer loop in record_window.  The budget covers the first window's
