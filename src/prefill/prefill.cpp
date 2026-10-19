@@ -29,6 +29,7 @@
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/core/layer.hpp"
+#include "strata/tp/dims.hpp"   // the per-rank GDN/QSA counts: gdn_*_rank
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -40,6 +41,7 @@
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/tp_runtime.hpp"
 #include "strata/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -2369,6 +2371,31 @@ struct PeTimer {
 };
 }  // namespace
 
+// THE GDN STATE'S PER-RANK DIMENSIONS: include/strata/tp/dims.hpp, the one home (see the KV page-stride bug,
+// docs/TP2-HANDOVER.md section 0, for what happens when a second copy drifts).
+using strata::tp::gdn_v_heads_rank;
+using strata::tp::gdn_channels_rank;
+using strata::tp::gdn_k_heads_rank;
+
+// STRATA_DBG_GDN=1: which step of the GDN block first holds a non-finite value.  STRATA_DBG_NAN only checks the
+// MoE, which is downstream of the block that actually goes bad, so this is the probe that localises it.
+static void dbg_gdn(int64_t layer, const char* what, const float* d, int64_t n, void* stream) {
+    static const bool on = std::getenv("STRATA_DBG_GDN") != nullptr;
+    if (!on || !d || n <= 0) return;
+    cudaStreamSynchronize((cudaStream_t) stream);
+    const int64_t k = std::min<int64_t>(n, (int64_t) 1 << 22);
+    std::vector<float> h((size_t) k);
+    if (cudaMemcpy(h.data(), d, (size_t) k * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    int64_t c = 0;
+    float mx = 0.0f;
+    for (float v : h) {
+        if (!std::isfinite(v)) ++c;
+        else if (std::fabs(v) > mx) mx = std::fabs(v);
+    }
+    if (c) std::fprintf(stderr, "strata dbg gdn: layer %lld %-14s %lld of %lld non-finite (max |x| %.4g)\n",
+                        (long long) layer, what, (long long) c, (long long) k, mx);
+}
+
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     err.clear();
     // force_chunk is for this run only: taken before any early return can leave it to the next one
@@ -2404,8 +2431,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         ~KvDrain() { if (stream) cudaStreamSynchronize(stream); }
     } kv_drain{kv_prefetch ? m.kv_copy : nullptr};
     int64_t kv_prefetches = 0;
-    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * gdn_v_heads_rank(g) * g.ssm_state_size +
+                                (uint64_t) gdn_channels_rank(g) * (g.ssm_d_conv - 1);
     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
     // layer split: a prompt of one chunk runs the stages one after the other, so the next stage's GPU idles while
     // this one reads; it streams and computes a share of this stage's experts then (set_stage_helper), in the
@@ -2654,8 +2681,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     err = "prefill: releasing KV staging pool";
                     return false;
                 }
+                // TENSOR PARALLEL: the stage pool holds the RANK's K/V heads (it is allocated with
+                // `qsa_shapes_rank` and `kv_append` writes `row_id` with the rank's count).  `kv_stage_from_host`
+                // sizes a block from the shapes it is given, so the model's `s` moved block b at twice the rank's
+                // offset and the stage's cells were other tokens' data - the first QSA layer's attention then read
+                // values like 2.3e6 and the layer went non-finite.  Rank-local shapes here.
+                strata::kernels::QsaShapes skv = s;
+                {
+                    const int64_t tk = std::max<int64_t>(1, (int64_t) strata::core::tp_ranks_current());
+                    skv.n_head = (int) ((int64_t) s.n_head / tk);
+                    skv.n_head_kv = (int) ((int64_t) s.n_head_kv / tk);
+                }
                 strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), state.host,
-                    core::qsa_kv_format(state), (p0 + s.page_size - 1) / s.page_size, s, m.kv_copy);
+                    core::qsa_kv_format(state), (p0 + s.page_size - 1) / s.page_size, skv, m.kv_copy);
                 if (cudaPeekAtLastError() != cudaSuccess ||
                     cudaEventRecord(m.kv_ready, m.kv_copy) != cudaSuccess) {
                     err = "prefill: enqueueing KV prefetch";
@@ -3023,20 +3061,38 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!wqkv || !wg || !wo || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
-                    float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    float* conv = state + (uint64_t) g.ssm_state_size * gdn_v_heads_rank(g) * g.ssm_state_size;
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                     if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
-                    if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
-                    if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                    // TENSOR PARALLEL: the GDN block is rank-local (its alpha/beta rows, its conv width, its v-heads),
+                    // so every count here is the RANK's - 48/16/10240 on one card, 24/8/5120 per rank - and the
+                    // buffers keep their full-size allocation with the rank's rows packed at the rank-local stride.
+                    const int64_t ghv = gdn_v_heads_rank(g), gch = gdn_channels_rank(g), ghk = gdn_k_heads_rank(g);
+                    if (std::getenv("STRATA_DBG_GDN"))
+                        std::fprintf(stderr, "strata dbg gdn: layer %lld counts ghv=%lld gch=%lld ghk=%lld tpr=%d "
+                                             "gdn_floats=%lld state_off=%lld\n", (long long) l, (long long) ghv,
+                                     (long long) gch, (long long) ghk, (int) strata::core::tp_ranks_current(),
+                                     (long long) gdn_floats,
+                                     (long long) ((gdn_index - ss.gdn_ord0) * gdn_floats));
+                    if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * ghv, m.mixed_bf_lo)) return false;
+                    if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + ghv, T, v.name("ssm_beta.weight"), err, 2 * ghv, m.mixed_bf_lo)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
-                    gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
-                    gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
+                    gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs, ghv);
+                    dbg_gdn(l, "gate", m.gate, T * ghv, m.cs);
+                    gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs, gch, ghv);
+                    dbg_gdn(l, "hbuf(conv)", m.hbuf, T * gch, m.cs);
                     pt.mark(kPfGdnRec, cs);
                     const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
                     gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs,
-                                   ld_y);
+                                   ld_y, ghv, ghk, gch);
                     pt.mark(kPfGdnOut, cs);
+                    dbg_gdn(l, "state(rec)", state, (int64_t) gdn_floats, m.cs);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
+                    dbg_gdn(l, "bo(ssm_out)", m.bo, T * g.n_embd, m.cs);
+                    // TENSOR PARALLEL: `ssm_out` contracts over the v heads, so this is a PARTIAL sum - the peer's
+                    // half is added before the next layer reads `bo_`.  On one card the runtime is null.
+                    if (!strata::core::tp_owed_reduce(m.bo, (int64_t) T * (int64_t) g.n_embd, m.cs, err)) return false;
+                    dbg_gdn(l, "bo(reduce)", m.bo, T * g.n_embd, m.cs);
                     ++gdn_index;
                 } else if (half == 0) {
                     // ======================= QSA =======================
@@ -3049,17 +3105,34 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wiqn = need(v, "indexer.q_norm.weight", err),
                                           *wikn = need(v, "indexer.k_norm.weight", err);
                     if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
+                    // TENSOR PARALLEL: `attn_q`/`attn_k`/`attn_v` are cut by HEAD and `attn_output` by contraction
+                    // (`shard.hpp`), so a rank owns only ITS heads and the rank's head loops must run over them -
+                    // `verify.cpp:986` does the same.  With one rank both equal the geometry's numbers.
+                    const int64_t tp_r = (int64_t) strata::core::tp_ranks_current();
+                    const int64_t kvh = g.n_head_kv / tp_r;     // this rank's K/V heads
+                    const int64_t qh = g.n_head / tp_r;         // this rank's query heads
                     pt.mark(kPfQsa, cs);
                     if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
                     if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
                     if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
-                    rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
-                    rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                    rms_rows(m.Kc, (const float*) wkn->data, T * kvh, 256, 256, EPS, m.cs);
+                    rope(m.Kc, T, kvh, 256, kvh * 256, p0, strata::kernels::rope_scaling(), m.cs);
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
                     const bool staged = st.kv_mode == 1;
+                    // TENSOR PARALLEL: the stage pool and the host copy hold the RANK's K/V heads (the pool is
+                    // allocated with `qsa_shapes_rank` and `kv_append` writes `row_id` with the rank's count), while
+                    // `kv_stage_from_host` / `kv_unstage_to_host` size a block from the shapes they are given.  With
+                    // the model's `s` (n_head_kv = 2) they moved block b at twice the rank's offset, so the stage's
+                    // cells were other tokens' data - the first QSA layer's attention then read values like 2.3e6.
+                    strata::kernels::QsaShapes skv = s;
+                    {
+                        const int64_t tk = std::max<int64_t>(1, (int64_t) strata::core::tp_ranks_current());
+                        skv.n_head = (int) ((int64_t) g.n_head / tk);
+                        skv.n_head_kv = (int) ((int64_t) g.n_head_kv / tk);
+                    }
                     if (staged) {
                         pt.mark(kPfKvStage, cs);
                         if (kv_pending == qsa_index) {
@@ -3070,7 +3143,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             kv_pending = -1;
                         } else strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
                                                             core::qsa_kv_format(st),
-                                                            (p0 + s.page_size - 1) / s.page_size, s, m.cs);
+                                                            (p0 + s.page_size - 1) / s.page_size, skv, m.cs);
                         pt.mark(kPfQsa, cs);
                         pf_step("reading the prompt (batched, step sync): the K/V staged from RAM at layer", l);
                     }
@@ -3088,7 +3161,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const strata::kernels::KvHostPools* host_w = host_by_dma ? nullptr : &st.host;
                     if (st.kv_hybrid) {   // K8V4: K INT8 unrotated, V rotated Q4_0 (only V and the output rotate)
                         // streamed: each half writes its part of the host copy and of the staging pool
-                        strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
+                        strata::kernels::fwht256_inplace_cuda(m.Vc, T * kvh, m.cs);
                         const strata::kernels::KvHostPools hk = strata::kernels::kv_hybrid_k_half(st.host),
                                                            hv = strata::kernels::kv_hybrid_v_half(st.host),
                                                            sk = strata::kernels::kv_hybrid_k_half(m.stage),
@@ -3096,13 +3169,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const bool mirror = st.host.present();
                         kv_append(m.Kc, m.Kc, T, p0, st.page_table, s.page_size, nullptr, nullptr,
                                   st.k_q, st.k_q, st.k_scale, st.k_scale, m.cs, mirror ? &hk : nullptr,
-                                  staged ? &sk : nullptr);
+                                  staged ? &sk : nullptr, kvh, 0, kvh);
                         strata::kernels::kv_append_q4(st.v_q4, st.v_q4, st.page_table, p0, T, m.Vc, m.Vc, s, m.cs,
                                                       mirror ? &hv : nullptr, staged ? &sv : nullptr);
                     } else {
                         if (st.kv_rot) {   // rotated K and V (kv_q4.hpp), the queries below too, the output back
                             strata::kernels::fwht256_inplace_cuda(m.Kc, T * 2, m.cs);
-                            strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
+                            strata::kernels::fwht256_inplace_cuda(m.Vc, T * kvh, m.cs);
                         }
                         if (st.kv_q4)
                             strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
@@ -3110,17 +3183,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         else
                             kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
-                                      host_w, staged ? &m.stage : nullptr);
+                                      host_w, staged ? &m.stage : nullptr, kvh, 0, kvh);
                         if (host_by_dma)
                             strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host,
                                                                 core::qsa_kv_format(st), p0 / s.page_size,
-                                                                (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
+                                                                (p0 + T + s.page_size - 1) / skv.page_size, skv, m.cs);
                     }
                     if (staged) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
-                    split_q(m.Qf, m.q, T, m.cs);
-                    rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
-                    rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
-                    if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
+                    split_q(m.Qf, m.q, T, m.cs, qh);
+                    rms_rows(m.q, (const float*) wqn->data, T * qh, 256, 256, EPS, m.cs);
+                    rope(m.q, T, qh, 256, qh * 256, p0, strata::kernels::rope_scaling(), m.cs);
+                    if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * qh, m.cs);
                     rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
                     rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), m.cs);
                     // the indexer appends, token by token; then scores + selection for many queries at once:
@@ -3256,25 +3329,47 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
                                                                        : core::qsa_attn_pools(st);
+                    if (std::getenv("STRATA_DBG_GDN"))
+                        std::fprintf(stderr, "strata dbg gdn: layer %lld staged=%d kv_mode=%d page_size=%lld "
+                                             "s.n_head_kv=%d\n", (long long) l, (int) staged, (int) st.kv_mode,
+                                     (long long) s.page_size, (int) s.n_head_kv);
                     pt.mark(kPfQsaAttn, cs);
                     // perf-review D-1: the whole chunk on tensor cores, one block per (query, KV head), FP32-level
                     // accuracy but not bitwise (qsa_prompt_attn.hpp). Q4_0 KV, or STRATA_PROMPT_ATTN_OLD=1: the
                     // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
                     // V dequantized from its q4_0 blocks to fp16 at gather)
                     static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
-                    if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
+                    // TENSOR PARALLEL: `split_q` packs the rank's query heads TIGHTLY (`q[i] = qf[t*H*512 + h*512 + d]`,
+                    // i = t*H*256 + h*256 + d), and `rope`/`rms_rows`/`gate_attn` all address that buffer with the
+                    // rank's `qh*256` stride.  The attention was the only reader still using the model's numbers: it
+                    // walked queries at `n_head_kv * G * head_dim` = 24 heads while the buffer holds 12, so from the
+                    // second query on it read past the data - which corrupted the whole QSA layer's output and is
+                    // what turned the next layer's GDN block non-finite.  One card: sq == s, stride == ZV.
+                    const int64_t tpr_q = std::max<int64_t>(1, (int64_t) strata::core::tp_ranks_current());
+                    strata::kernels::QsaShapes sq = s;
+                    sq.n_head = (int) (g.n_head / tpr_q);
+                    sq.n_head_kv = (int) (g.n_head_kv / tpr_q);
+                    const int64_t qstride = (int64_t) sq.n_head * (int64_t) g.head_dim;
+                    if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, sq,
                                                                             m.attn, T, m.cs))
                         for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
                             const int64_t nb = std::min(m.attn_batch, T - t0);
-                            strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
+                            strata::kernels::qsa_decode_attn_batch(m.q + t0 * qstride, pools, m.sel_ids + t0 * m.cap,
                                                                    m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
-                                                                   s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
+                                                                   sq, m.attn_scratch, m.attn + t0 * qstride, nb, m.cs);
                         }
-                    if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
+                    dbg_gdn(l, "qsa q(in)", m.q, T * qh * 256, m.cs);
+                    dbg_gdn(l, "qsa attn", m.attn, T * qh * 256, m.cs);
+                    if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * qh, m.cs);
                     pt.mark(kPfQsa, cs);
                     const int64_t ld_a = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
-                    gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a);
+                    gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a, qh);
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, ld_a)) return false;
+                    dbg_gdn(l, "qsa bo(proj)", m.bo, T * g.n_embd, m.cs);
+                    // TENSOR PARALLEL: `attn_output` contracts over the head width, so this is a PARTIAL sum - the
+                    // peer's half is added before the next layer reads `bo_`.  On one card the runtime is null.
+                    if (!strata::core::tp_owed_reduce(m.bo, (int64_t) T * (int64_t) g.n_embd, m.cs, err)) return false;
+                    dbg_gdn(l, "qsa bo(reduce)", m.bo, T * g.n_embd, m.cs);
                     ++qsa_index;
                     if (!kv_prefetch_after(l + 1, qsa_index)) return false;
                 } else {

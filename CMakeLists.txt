@@ -1,4 +1,4 @@
-﻿# Strata Engine - top-level build (P1.S1).
+# Strata Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -289,6 +289,63 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(split_rules_test PRIVATE include)
   add_test(NAME split_rules_test COMMAND split_rules_test)
 
+  # tensor parallelism's per-tensor split table: header-only rule, no GPU.  Checks the axes, the refusals an
+  # un-splittable geometry gets (an odd head count, one KV head between two ranks) and that the two ranks'
+  # ranges tile every axis exactly once.
+  add_executable(tp_shard_test tests/core/tp_shard_test.cpp)
+  target_include_directories(tp_shard_test PRIVATE include)
+  add_test(NAME tp_shard_test COMMAND tp_shard_test)
+
+  # the native (GGUF-layout) side of a split matrix: pure arithmetic, no GPU, no GGUF, no model
+  add_executable(tp_native_shard_test tests/core/tp_native_shard_test.cpp)
+  target_include_directories(tp_native_shard_test PRIVATE include)
+  add_test(NAME tp_native_shard_test COMMAND tp_native_shard_test)
+
+  # the seam that decides whether a partial sum is owed: null by default, which is the default path's guarantee
+  add_executable(tp_runtime_test tests/core/tp_runtime_test.cpp)
+  target_include_directories(tp_runtime_test PRIVATE include)
+  add_test(NAME tp_runtime_test COMMAND tp_runtime_test)
+
+  # the runtime the layer code calls: its refusals, and a real two-card collective through it (GPU, skippable)
+  if(STRATA_ENABLE_CUDA AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/allreduce.cu")
+    add_executable(tp_host_runtime_test tests/core/tp_host_runtime_test.cu src/kernels/cuda/allreduce.cu)
+    target_include_directories(tp_host_runtime_test PRIVATE include ${_strata_gpu_include_directories})
+    set_target_properties(tp_host_runtime_test PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+    add_test(NAME tp_host_runtime_test COMMAND tp_host_runtime_test)
+    set_tests_properties(tp_host_runtime_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
+    # a REAL pack under a rank's plan: skips unless STRATA_TP_REAL_PACK points at one, and reads it rather than
+    # running it (seconds, a few GB of VRAM)
+    add_executable(tp_real_load_test tests/core/tp_real_load_test.cu src/core/native_dense.cpp)
+    target_link_libraries(tp_real_load_test PRIVATE strata_core strata_kernels)
+    target_include_directories(tp_real_load_test PRIVATE include ${_strata_gpu_include_directories})
+    add_test(NAME tp_real_load_test COMMAND tp_real_load_test)
+    set_tests_properties(tp_real_load_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+    # THE crux: a whole GDN layer run by two split ranks that reduce in the middle, against one card.  Needs a
+    # real pack and its GGUF shards, so it skips (77) without them.
+    add_executable(tp_layer_ab_test tests/core/tp_layer_ab_test.cu src/kernels/cuda/allreduce.cu)
+    target_link_libraries(tp_layer_ab_test PRIVATE strata_engine strata_core strata_kernels)
+    target_include_directories(tp_layer_ab_test PRIVATE include ${_strata_gpu_include_directories})
+    set_target_properties(tp_layer_ab_test PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+    add_test(NAME tp_layer_ab_test COMMAND tp_layer_ab_test)
+    set_tests_properties(tp_layer_ab_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+    # TWO RANKS RUN ONE WINDOW, against ONE: the tensor-parallel A/B in its smallest honest form (one token, no
+    # expert cache, no graphs).  Needs a real pack, so it skips (77) without one.
+    add_executable(tp_window_ab_test tests/core/tp_window_ab_test.cu src/kernels/cuda/allreduce.cu)
+    target_link_libraries(tp_window_ab_test PRIVATE strata_engine strata_core strata_kernels)
+    target_include_directories(tp_window_ab_test PRIVATE include ${_strata_gpu_include_directories})
+    set_target_properties(tp_window_ab_test PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+    add_test(NAME tp_window_ab_test COMMAND tp_window_ab_test)
+    set_tests_properties(tp_window_ab_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+  endif()
+
+  # tensor parallelism's flag rules and refusals: header-only rule, no GPU
+  add_executable(tp_rules_test tests/program/tp_rules_test.cpp)
+  target_include_directories(tp_rules_test PRIVATE include)
+  add_test(NAME tp_rules_test COMMAND tp_rules_test)
+
   # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE include)
@@ -398,6 +455,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
+                          src/kernels/cuda/allreduce.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -552,6 +610,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
+    src/tp/tp_diag.cpp   # TPDIAG infrastructure (the probes calling it live in verify.cpp)
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -956,6 +1015,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_test(NAME dma_batch_registered_parity COMMAND dma_batch_parity --registered)
       set_tests_properties(dma_batch_registered_parity PROPERTIES TIMEOUT 120)
     endif()
+    # Tensor parallelism's cross-GPU sum: the two ranks' results must be BIT-IDENTICAL, a captured graph must
+    # still be correct on its second replay (a host-side arrival token is not), and a peer that never arrives
+    # must be given up on rather than hang the box.  Skips (77) on a machine with fewer than two GPUs.
+    add_executable(tp_allreduce_test tests/core/tp_allreduce_test.cu)
+    target_include_directories(tp_allreduce_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(tp_allreduce_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME tp_allreduce_test COMMAND tp_allreduce_test)
+    set_tests_properties(tp_allreduce_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     add_executable(gdn_rec_parity src/prefill/gdn_rec_parity.cu)
     target_link_libraries(gdn_rec_parity PRIVATE ${_strata_gpu_runtime_target})
     add_test(NAME gdn_rec_parity COMMAND gdn_rec_parity)

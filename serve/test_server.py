@@ -2445,6 +2445,47 @@ class LayerSplit(unittest.TestCase):
                          ["--native", "x"])
 
 
+class TensorParallel(unittest.TestCase):
+    """--tp: two cards run every layer, each dense tensor's output axis is cut in half (the engine's rules are in
+    include/strata/program/tp_rules.hpp). The server's own job here is narrow and easy to get wrong: a config that
+    asks for TP must NOT also get --layer-split, because the engine refuses both at once and the run would not
+    start."""
+
+    def cfg(self, tp, gpus=(0, 2)):
+        c = {"args": ["--native", "x"], "gpu": list(gpus)}
+        if tp is not ...:
+            c["tp"] = tp
+        return c
+
+    def test_tp_is_added_and_is_two(self):
+        for v in (2, [0, 2], "2", True):
+            self.assertIn("--tp", engine_args(self.cfg(v)))
+        self.assertEqual(engine_args(self.cfg(2))[-2:], ["--tp", "2"])
+        # a list names the CARDS, the way "gpu" does, not the rank count
+        self.assertEqual(engine_args(self.cfg([2, 0]))[-2:], ["--tp", "2"])
+
+    def test_no_tp_means_no_argument(self):
+        for v in (..., None, 0, False, "", []):
+            self.assertNotIn("--tp", engine_args(self.cfg(v)))
+
+    def test_tp_replaces_the_layer_split(self):
+        # the one integration that matters: with TP, gpu=[0, 2] must not also produce --layer-split
+        args = engine_args(self.cfg(2))
+        self.assertIn("--tp", args)
+        self.assertNotIn("--layer-split", args)
+        # ... and without TP the same two cards are still a layer split (asserted through engine_args, which is
+        # what the layer split's own tests read for the same property)
+        self.assertIn("--layer-split", engine_args(self.cfg(...)))
+        # an explicit --tp in the args is left alone (not doubled)
+        self.assertEqual(engine_args({"args": ["--native", "x", "--tp", "2"], "gpu": [0, 2], "tp": 2}),
+                         ["--native", "x", "--tp", "2"])
+
+    def test_tp_does_not_add_the_split_skip(self):
+        # "split_skip_if_fits" belongs to the layer split; with TP there is no split to skip on
+        args = engine_args(self.cfg(2, ) | {"split_skip_if_fits": True})
+        self.assertNotIn("--split-skip-if-fits", args)
+
+
 class DraftHeadHint(unittest.TestCase):
     """#474: a start that stopped at "the draft head does not fit" says what to change, from this start's log lines."""
 

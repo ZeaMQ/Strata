@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/native_shard.hpp"   // `shard_runs`: the kept bytes of a split matrix, unit-tested
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -184,7 +185,8 @@ void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le 
 // on the card when the split search prices that stage, and `load` runs one cudaMalloc per matrix (#1238).  The two
 // have to stay in step.  A repeated name is skipped rather than refused (`load` refuses it).
 bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, WeightTable& table, bool include_ple_key,
-                                   int64_t lb, int64_t le, uint64_t& out, std::string& err) {
+                                   int64_t lb, int64_t le, uint64_t& out, std::string& err,
+                                   const ShardPlan* shard) {
     out = 0;
     try {
         std::set<std::string> seen;
@@ -195,7 +197,11 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
                 if (!eligible(tensor, include_ple_key)) continue;
                 if (tensor.name.rfind("blk.", 0) == 0) {
                     const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
-                    if (l < lb || l >= le) continue;
+                    // `le < 0` means EVERY layer, the same way `load`'s `layer_hi < 0` does.  The two have to
+                    // agree: this function sizes the arena and `load` fills it, and a walk that skipped every
+                    // layer would under-reserve by the whole model.  (Found by calling it with -1, which the
+                    // engine never does - it always passes a stage's real range - so this was latent.)
+                    if (le >= 0 && (l < lb || l >= le)) continue;
                 }
                 if (!seen.insert(tensor.name).second) continue;
                 auto found = table.table_.find(tensor.name);
@@ -206,9 +212,29 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
                 const auto& ref = found->second;
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
                 if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
-                if (!ref.quantized() || tensor.shape.size() != 2 ||
-                    ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
-                    tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
+                // The rows this rank keeps, the same way `load` decides them: `ref.ne1` is already the SHARDED
+                // extent, so the GGUF's own width is checked against the ranges and not against it.  This
+                // function pre-sizes the arena, so a walk that reported the whole matrix would reserve twice
+                // what the load then allocates.
+                // The same two conditions `load` checks, with the same meaning: `ref.ne0`/`ref.ne1` are the
+                // SHARDED extents the canonical loader recorded, so an output split is checked against its row
+                // count and a contraction split against its column count.  THIS WALK SIZES THE ARENA `load`
+                // THEN FILLS, so a rule that lives in only one of the two is a budget that disagrees with the
+                // allocation - which is what this function did until a real pack was tried: it still refused
+                // the contraction axis months after `load` learned to split it.
+                const TensorShard* ts = nullptr;
+                if (shard != nullptr) {
+                    const auto sit = shard->find(tensor.name);
+                    if (sit != shard->end()) ts = &sit->second;
+                }
+                const bool output_split = ts != nullptr && ts->axis == ShardAxis::Output;
+                const bool input_split = ts != nullptr && ts->axis == ShardAxis::Input;
+                const bool shape_ok = tensor.shape.size() == 2 && ref.quantized() && ref.ne0 > 0 &&
+                                      ref.ne0 <= INT_MAX && ref.ne1 > 0 && ref.ne1 <= INT_MAX &&
+                                      (input_split ? (ts->kept() == ref.ne0 && tensor.shape[1] == (uint64_t) ref.ne1)
+                                                   : (tensor.shape[0] == (uint64_t) ref.ne0)) &&
+                                      (output_split ? ts->kept() == ref.ne1 : tensor.shape[1] == (uint64_t) ref.ne1);
+                if (!shape_ok) {
                     err = "native dense: incompatible matrix " + tensor.name;
                     return false;
                 }
@@ -249,7 +275,7 @@ NativeDense::~NativeDense() {
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
+                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi, const ShardPlan* shard) {
     auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
@@ -342,18 +368,65 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
                 // #326: the pack keeps an unquantized (--compat-bf16) key, which the PLE reads from the arena
                 if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
-                if (!ref.quantized() || tensor.shape.size() != 2 ||
-                    ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
-                    tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
-                    err = "native dense: incompatible matrix " + tensor.name; return false;
+                // Which rows of the GGUF matrix this rank keeps.  `ref.ne1` is the SHARDED extent the canonical
+                // loader recorded (a tensor-parallel load cuts the output axis), so the checks below compare
+                // the GGUF's own width against the RANGES rather than against `ref.ne1` - the old check would
+                // refuse every split tensor with "incompatible matrix", which is how this was found.
+                const TensorShard* ts = nullptr;
+                if (shard != nullptr) {
+                    const auto sit = shard->find(tensor.name);
+                    if (sit != shard->end()) ts = &sit->second;
                 }
+                // THE KEPT BYTES, AS A LIST OF RUNS.  A run is (source offset, length) inside the GGUF matrix,
+                // and the destination is the runs packed in this order - which for a quantized tensor is
+                // exactly the engine form: whole rows for an output split, and for a contraction split every
+                // row keeps the same block range, so row `o` starts at `o * (kept blocks) * block_bytes`.
+                const uint64_t full_bytes = strata::kernels::native_mmvq_weight_bytes(
+                    tensor.type, (int) tensor.shape[0], (int) tensor.shape[1]);
+                int block_elements = 0, block_bytes = 0;
+                (void) strata::block_geometry(tensor.type, block_elements, block_bytes);
+                // ONE COPY OF THIS LOGIC, in `core/native_shard.hpp`, where it is pure arithmetic and
+                // unit-tested on its own (`tp_native_shard_test`): boundaries, the K-quant super-block case and
+                // every refusal.  A second copy here could drift from the tested one, and a shard built from
+                // the wrong bytes still has the right shape.
+                std::vector<ShardRun> runs;
+                if (!strata::core::shard_runs(tensor.shape[0], tensor.shape.size() > 1 ? tensor.shape[1] : 1,
+                                              full_bytes, block_elements, block_bytes, ts, runs, err)) {
+                    err = "native dense: " + tensor.name + ": " + err;
+                    return false;
+                }
+                const uint64_t runs_bytes = strata::core::shard_runs_bytes(runs);
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
+                if (!ref.quantized() || tensor.shape.size() != 2 ||
+                    ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
+                    (ts == nullptr && tensor.shape[0] != (uint64_t) ref.ne0) ||
+                    (ts == nullptr && tensor.shape[1] != (uint64_t) ref.ne1) ||
+                    (ts != nullptr && ts->axis == ShardAxis::Output && ts->kept() != ref.ne1) ||
+                    (ts != nullptr && ts->axis == ShardAxis::Input && ts->kept() != ref.ne0) ||
+                    runs_bytes != bytes) {
+                    char buf[320];
+                    std::snprintf(buf, sizeof buf,
+                                  "native dense: incompatible matrix %s (gguf %llux%llu, shard %lldx%lld, "
+                                  "%llu B of runs against %llu B of engine form)",
+                                  tensor.name.c_str(), (unsigned long long) tensor.shape[0],
+                                  (unsigned long long) tensor.shape[1], (long long) ref.ne0, (long long) ref.ne1,
+                                  (unsigned long long) runs_bytes, (unsigned long long) bytes);
+                    err = buf;
+                    return false;
+                }
+                const uint8_t* src = (const uint8_t*) gguf.tensor_data(tensor);
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
-                if (status == cudaSuccess)
-                    status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
+                uint64_t at = 0;
+                uint8_t* dst = (uint8_t*) data.get();
+                for (const ShardRun& run : runs) {
+                    if (status != cudaSuccess) break;
+                    status = cudaMemcpy(dst + at, src + run.src, run.len, cudaMemcpyHostToDevice);
+                    at += run.len;
+                }
+                if (status == cudaSuccess && at != bytes) status = cudaErrorInvalidValue;
                 if (status != cudaSuccess) {
                     err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
                 }

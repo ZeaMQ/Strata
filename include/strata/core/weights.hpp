@@ -1,4 +1,4 @@
-﻿// include/strata/core/weights.hpp - the dense weights, loaded into VRAM in ENGINE form.
+// include/strata/core/weights.hpp - the dense weights, loaded into VRAM in ENGINE form.
 //
 // The pack is the ARTIFACT's business; this is the ENGINE's.  The differences are deliberate, and they run in
 // BOTH directions:
@@ -26,6 +26,8 @@
 // whose failure mode is a wrong byte offset - which decodes to a plausible weight and produces plausible
 // logits.  Python wrote the manifest and already parses it correctly.
 #pragma once
+
+#include "strata/core/shard.hpp"
 
 #include <cstdint>
 #include <map>
@@ -116,8 +118,11 @@ public:
     /// `DeviceArena` before committing to the load, and a plan that cannot fit is refused at startup rather
     /// than halfway through a 5 GB upload.
     /// With `skip`, the size of the compacted arena that holds every tensor EXCEPT the named ones.
+    /// With `shard`, the size of the arena that holds THIS RANK'S PART of the tensors the plan names - the
+    /// sum of the sharded plane sizes, so a tensor-parallel stage sizes its arena before reading a byte.
     static bool pool_bytes(const std::string& pack_dir, uint64_t& out, std::string& err,
-                           const std::set<std::string>* skip = nullptr);
+                           const std::set<std::string>* skip = nullptr,
+                           const ShardPlan* shard = nullptr);
 
     /// The `code_bits` field of one row of `<pack_dir>/index.txt`, readable WITHOUT loading anything (0 = the
     /// pack stores the tensor unquantized, e.g. a --compat-bf16 key; -1 = no such row).  #326: the loader has
@@ -131,8 +136,13 @@ public:
     /// because the failure mode otherwise is a device write past the end of the arena.
     /// With `skip`, the named tensors are not read: their rows keep their metadata with `data == nullptr` and
     /// `resident == false`, and the other tensors are packed into the compacted arena `pool_bytes` sized.
+    ///
+    /// With `shard`, only THIS RANK'S PART of the tensors the plan names is read, and the `WeightRef` reports
+    /// the SHARDED shape - a tensor cut in half arrives as a tensor half as wide, so a kernel that indexes it
+    /// needs no notion of tensor parallelism at all for the OUTPUT axis.  A `Rank0` tensor the plan marks
+    /// `keep == false` is not read, exactly like a skipped one.
     bool load(const std::string& pack_dir, void* arena_base, uint64_t arena_bytes, std::string& err,
-              const std::set<std::string>* skip = nullptr);
+              const std::set<std::string>* skip = nullptr, const ShardPlan* shard = nullptr);
 
     /// A SKIPPED bf16 tensor's values read back from the pack file (the promoted-f32 and the raw 16-bit forms), for
     /// the host-side Q8_0 quantizer of STRATA_HC_Q8 (the tensor then has no copy in the arena).

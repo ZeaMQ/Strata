@@ -1,3 +1,65 @@
+> # This is a fork, not Strata
+>
+> It exists for one thing: handing over an unfinished experiment — tensor parallel (`--tp 2`) on two RTX
+> 3080s. Branch `tp2-wip`, on top of `296b59d2` (engine **0.1.44.1**). Upstream is
+> [Niko1221/Strata](https://github.com/Niko1221/Strata).
+>
+> **Update 2026-10-19: the fast path's `non-finite logits` is fixed** (commit `7f55fd3`) — see the
+> [handover](docs/TP2-HANDOVER.md), section "RESOLVED". Measured at EQUAL prompt lengths against the layer
+> split on this machine, the fixed TP=2 fast path **matches it at every length measured** (table below).
+> It is still handed over — one latent timing bug (handover section 0a), no human review, several untested
+> combinations — but not because it is slow.
+>
+> 中文版本：[README.zh-CN.md](README.zh-CN.md)
+>
+> ## Speed (the one table worth remembering)
+>
+> Same documents, warm expert cache, `max_tokens=1`, client-side wall clock, same box and pack, 2026-10-19:
+>
+> | prompt length | TP=2 fast path (fixed) | layer split (PP) |
+> |---|---|---|
+> | ~11.7k tokens | 1 510–1 520 tok/s | 1 519–1 535 tok/s |
+> | 24.8k tokens | 1 907 tok/s | 1 904 tok/s |
+> | 123.6k tokens | **2 994 / 3 027 tok/s** (two runs) | **2 987 / 3 046 tok/s** (two runs) |
+> | 380k tokens | **2 993 tok/s** (warm ladder) | **2 941 tok/s** |
+>
+> Prefill speed RISES with prompt length on both paths (a ~1 s fixed per-request cost amortizes and the
+> expert cache warms across chunks) — every earlier "TP is slower" number in this document's history
+> compared different lengths; the author's 2900+ is the long-context end of the same curve (a live
+> observation of 3 248 tok/s at 380k+ agrees). PCIe is not the limit: `nvidia-smi dmon -s t` during the
+> 123.6k run gives 4–7 GB/s mean per card (Rx+Tx) against ~22 GB/s peak bursts. The shared ceiling is the
+> host-side expert pipeline (grouping + streaming), which is why the two schemes converge. One asymmetry
+> is open (handover 0b): a COLD 380k prefill is ~2x slower on TP than on PP - TP's 6 338 cache slots
+> spread over 48 layers (132/layer) against the split's 24 (264/layer) - and two back-to-back cold 380k
+> runs did not warm TP, while a 36k→124k→380k ladder fully did.
+>
+> Decode depends strongly on context length. TP matches the split at
+> 180k context (streamed, 250-token buckets: TP median **94.1** vs PP **95.5**, min/max within 2%) and on
+> the counting task 1→300 (TP **194** vs PP **191**, both correct). The author's 99.3 is the split at 36k -
+> the same curve. One regime is unsettled: short-context prose decode measured TP 140-155 vs PP 191.8 on
+> thin, one-sided evidence (handover 0a). The verify-window path (the TP default, kept as the safe
+> fallback) stays at 37–52 tok/s.
+>
+> ## Details live in the documents
+>
+> - **English handover: [docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md)** — reproducible measurements, the full
+>   evidence chain, the 13 rejected hypotheses and the 14th pass that fixed it, the two-stage plan
+>   (990 → 2900 arithmetic), the two real bugs, what was not tested, and the three steps to resume
+> - 中文完整版: [docs/TP2-HANDOVER.zh-CN.md](docs/TP2-HANDOVER.zh-CN.md)
+> - diff: [main...tp2-wip](https://github.com/ZeaMQ/Strata/compare/main...tp2-wip) (39 files)
+> - upstream issues: [#3025](https://github.com/Niko1221/Strata/issues/3025) (this handover, closed) ·
+>   [#156](https://github.com/Niko1221/Strata/issues/156) (closed as not planned; the measurements here
+>   support that decision)
+>
+> **Provenance:** AI-assisted in one long session that ran **over 400 assistant turns and 4 000 tool steps**
+> (the session's own counters), **not human-reviewed**; the fast path stayed unsolved through **13** separate
+> fix attempts — the 14th, a full read/write ledger of every KV pool, found and fixed it. Only CUDA was
+> built — HIP and SYCL are unverified.
+>
+> ---
+>
+> Everything below is upstream's README, unchanged.
+
 <h1 align="center">Strata</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)

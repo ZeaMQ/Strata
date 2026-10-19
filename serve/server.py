@@ -68,6 +68,7 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
+from serve.tp_config import tp_of, tp_value, tp_extra_args, tp_startup_check  # noqa: E402  (TP-owned module)
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -2636,8 +2637,9 @@ def layer_split_value(cfg: dict) -> str:
 
 def layer_split_of(cfg: dict) -> bool:
     """Several GPUs in the config are a layer split, unless the args put the later card(s) to another use: with
-    --peer-device the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665)."""
-    return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
+    --peer-device the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665).
+    A config that asks for TP is not a layer split either - the two are mutually exclusive by design."""
+    return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"] and not tp_of(cfg)
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -2657,6 +2659,7 @@ def engine_args(cfg: dict) -> list[str]:
             note += " and --vram-reserve-mib 700"
         print(f'[strata] the config has a "vision" section but no --vision in its args: {note} (run setup again with '
               "--vision to write them)", flush=True)
+    args += tp_extra_args(cfg, args)   # TP-owned: serve/tp_config.py
     if layer_split_of(cfg) and "--layer-split" not in args:
         args += ["--layer-split", layer_split_value(cfg)]
     # opt-in: an auto split runs on the first card alone when it holds every profiled expert and the KV
@@ -6902,7 +6905,9 @@ def main() -> int:
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
-        if layer_split_of(cfg):
+        if tp_of(cfg):
+            tp_startup_check(cfg, gpu_list, engine_args)   # TP-owned: serve/tp_config.py
+        elif layer_split_of(cfg):
             try:
                 split = layer_split_value(cfg)          # #644: before the (minutes-long) start
             except ValueError as e:

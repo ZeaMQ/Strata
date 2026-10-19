@@ -336,6 +336,50 @@ a card was freed is left out); b/a 5836 and 6432 (timed on the rig), against 102
 - Every card needs compute capability 7.5 (RTX 20 or newer). The pre-sm_80 QSA scorer path is fp32 FMAs, so a
   Turing card runs the same kernels instead of the tensor-core prompt attention.
 
+## Tensor parallelism (`--tp`, in progress - refused for now)
+
+**This is a different way to use a second card, and it is not usable yet.** The layer split above cuts the
+*stack* (each card runs some layers); tensor parallelism cuts *each layer* (both cards run every layer, and each
+dense tensor's output axis is halved, with the two ranks meeting on an all-reduce twice per layer).
+
+The engine refuses `--tp` with one line saying why and then continues on one card. It is refused because the
+loader already splits the dense tensors - so a run with it engaged would produce **plausible-looking wrong
+output**, which is worse than not starting:
+
+- the two halves of `ssm_out` and `attn_output` are **partial sums that are not reduced yet**;
+- the QSA head loops still run over every head, while a rank holds half of them.
+
+What is already in the tree, and how it was checked:
+
+- the split loader: both axes (rows, and the contraction axis block by block), on the canonical pack arena and
+  on the **native GGUF** path - byte-for-byte in `tests/core/tp_shard_load_test`, and a plan that marks every
+  tensor replicated produces an arena **byte-identical** to no plan at all;
+- the all-reduce: ported from `ggml-cuda/allreduce.cu` with three deliberate departures (a device-side token, so
+  a captured graph does not replay a stale one; ping-pong staging, because one buffer races; a monotonic arrival
+  comparison, so a release can unblock a waiter). Gate: `tests/core/tp_allreduce_test`;
+- the flag rules, the help text, the server's config key: `include/strata/program/tp_rules.hpp` and
+  `serve/test_server.py`.
+
+`--tp 2` is refused beside `--layer-split`, `--batch`, `--pipeline-windows`, `--peer-device`, `--vision`,
+`--mmap-experts`, `--kv-resident` and a session file, because each of those makes the two ranks' windows differ -
+and both ranks have to call the same reductions in the same order, or the one that arrives first waits for a
+peer that is not coming.
+
+On the test rig for this work (2x RTX 3080 20 GB, driver 581.80, Windows): **no peer access between the two
+cards (0/0)**, so the collective stages through host memory; pinned H2D/D2H 13.4 / 13.2 GB/s; one reduce costs
+33 us at one token and 36 us at six, and the 96 reduces of a 48-layer verify window come to about 3.5 ms, some
+7% of a ~47 ms window. That is not a claim that tensor parallelism is faster - the second card's own compute is
+not in that number, and the prompt side costs about 15% per 2048-token chunk.
+What the split is worth, measured on that same rig (`tp_sweep_bench`, 2x RTX 3080): reading a card's dense
+weights once costs **3.512 ms for the whole 2427 MiB side and 2.000 ms for one rank's 1381 MiB shard**, at
+**725 GB/s measured** - within a few percent of the card's own peak, which is what a bandwidth-bound decode
+reads at. A verify window holds T tokens and reads the weights once per token, so at T=6 - the log reports 88.9-102.1 tok/s, a ~59 ms window - the dense side is about
+21 ms of a 47 ms window and a rank's shard about 12 ms: **the dense split is worth about 9 ms a window, some
+19%**, and the two reductions a layer (36 GDN `ssm_out` + 12 QSA `attn_output`, ~36 us each at T=6) take about
+1.8 ms of that back - **so splitting only the dense side is a **~1.13-1.15x** decode, not the 1.5x a byte ratio
+suggests**. The other half of a window's weight traffic is the routed experts, and getting past ~1.2x means
+splitting those too.
+
 ## Measured
 
 The Coder on an RTX 5080 + RTX 3090 (Ryzen 9 9950X3D), 32K context; details in
@@ -464,3 +508,9 @@ These are opt-in settings on one rig, not defaults.
 
 With a layer split, `--batch N --batch-groups G --trim-stage-weights` decodes several conversations together and
 pipelines them through the cards: see [BATCHING.md](BATCHING.md).
+
+The same log is worth reading for a second reason: it ends a request with **165 MiB of VRAM free** and the
+engine's own warning that a card this full can page GPU memory to system RAM, where "decode falls to a few
+tok/s". Splitting the dense weights halves what each card holds - 2427 MiB becomes 1381 MiB - so TP also buys
+back about **1.2 GiB of headroom per card**, which at that margin may matter more than the 15% of compute: the
+failure it avoids is not being slow, it is falling off a cliff.

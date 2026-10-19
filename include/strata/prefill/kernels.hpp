@@ -56,16 +56,24 @@ void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream);
 
 // ---- GDN (state 128, 16 k heads, 48 v heads, 10240 conv channels, 4 taps)
-/// gate[t,h] = softplus(ab[t,h] + dt[h]) * ssm_a[h];  beta[t,h] = sigmoid(ab[t, 48 + h])  (ab: [T, 96])
-void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream);
+// TENSOR PARALLEL: `hv` (v heads) and `ch` (conv channels) are the RANK's counts - `48` / `10240` on one card,
+// `24` / `5120` per rank under --tp - so the same kernels run over a rank's half.  The defaults keep every
+// existing single-card call byte-identical.
+/// gate[t,h] = softplus(ab[t,h] + dt[h]) * ssm_a[h];  beta[t,h] = sigmoid(ab[t, 48 + h])  (ab: [T, 2*hv])
+void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream,
+               int64_t hv = 48);
 /// The 4-tap causal conv + SiLU over the chunk (history [C][3] in, updated to the chunk's last three inputs), then
-/// the L2 norm of the q and k heads of every token.  h: [T, C].
-void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream);
+/// the L2 norm of the q and k heads of every token.  h: [T, C].  `ch`/`hv`: the RANK's conv width and v-head count
+/// (10240/48 on one card, 5120/24 per rank under --tp).
+void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream,
+              int64_t ch = 10240, int64_t hv = 48);
 /// The recurrence over the chunk, state in registers; y16[t] = rmsnorm(o) * gamma * sigmoid(z) in FP16 (what the
-/// out projection reads); y is FP32 scratch.
+/// out projection reads); y is FP32 scratch.  `hvr`/`hkr`/`chr`: the RANK's v-head / k-head counts and conv width
+/// (48/16/10240 on one card, 24/8/5120 per rank under --tp).
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
-                    int64_t ld16 = 0);   // ld16: y16's row stride (0 = 6144; S23 STRATA_PF_PAD pads it)
+                    int64_t ld16 = 0, int64_t hvr = 48, int64_t hkr = 16, int64_t chr = 10240);
+                    // ld16: y16's row stride (0 = hvr*128; S23 STRATA_PF_PAD pads it)
 /// The kernels behind gdn_recurrence, for the parity test: 0 = the column-split kernels + the norm kernel (or the
 /// one-block-per-head kernel under STRATA_GDN_REC_HEADS), 1 = four lanes per column (no barrier per token) + the grid-stride norm, 2 = the
 /// one-block-per-head kernel (its fused norm rounds differently).  0 and 1 give the same bits.  On HIP, 0 and 1 run the opt-in
@@ -125,18 +133,24 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, 
 /// scaling (rope_scaling.hpp) rides in as the process config - none is today's arithmetic exactly.
 void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
           const strata::kernels::RopeScaling& scaling, void* stream);
-/// q_full [T, 24, 512] (q | gate per head) -> q [T, 24, 256]
-void split_q(const float* q_full, float* q, int64_t T, void* stream);
+/// q_full [T, heads, 512] (q | gate per head) -> q [T, heads, 256].  `heads` is the RANK's query-head count
+/// (`n_head / tp_ranks`); 24 is the single-card geometry, so a one-card run is unchanged.
+void split_q(const float* q_full, float* q, int64_t T, void* stream, int64_t heads = 24);
 /// attn[t, h, d] *= sigmoid(q_full[t, h, 256 + d]) -> out16 (fp16 bits: the o-projection is quantized)
-void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream, int64_t ld16 = 0);
+void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream, int64_t ld16 = 0,
+               int64_t heads = 24);
 
 /// K and V of T consecutive cells (positions pos0..pos0+T-1; K normed and rotated) into the paged pools: FP16
 /// (`k_pool`/`v_pool`) or INT8 codes + FP16 scale per 64 (`k_q`...), the decode append's arithmetic.
-/// K, V: [T, 2, 256].
+/// K, V: [T, heads, 256] - the caller's buffer holds exactly the heads it projected, packed at `heads * 256`.
+/// `heads` is the RANK's K/V head count (`n_head_kv / tp_ranks`), and `kvfull` is the POOL's heads-per-page:
+/// every destination (resident slots, host copy, staging pool) is allocated with the SAME rank-local page
+/// layout, so a rank passes `kvfull = heads` with `head_base = 0`.  Single card: heads=kvfull=2, head_base=0.
 void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
                void* stream, const strata::kernels::KvHostPools* host = nullptr,
-               const strata::kernels::KvHostPools* stage = nullptr);
+               const strata::kernels::KvHostPools* stage = nullptr, int64_t heads = 2, int64_t head_base = 0,
+               int64_t kvfull = 2);
 
 /// fp32 -> fp16 bits and fp32 -> bf16, n elements (the two activation images of the prompt GEMMs).
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream);

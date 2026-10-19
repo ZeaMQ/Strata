@@ -20,6 +20,7 @@
 #include <mutex>
 #include <utility>
 #include <vector>
+#include "strata/core/tp_runtime.hpp"   // allow_gdn_split: the GDN split is off for a pair
 
 namespace strata::kernels {
 namespace {
@@ -1113,7 +1114,9 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
     }
-    static const bool split = [] { const char* v = std::getenv("STRATA_GDN_SPLIT"); return v && v[0] == '1'; }();
+    // TENSOR PARALLEL: a pair refuses the split by default (measured; see strata::core::allow_gdn_split in
+    // include/strata/core/tp_runtime.hpp).  One card is unaffected.
+    static const bool split = strata::core::allow_gdn_split();
     // S26: the split runs where it is faster (gfx1151 harness, h_v 48: the commit 8-19% per call; a window of 2+ rows
     // 3-13%; one row: no gain, the old kernel stays) - bitwise equal in every case
     if (split && (t_out_begin >= n_tok || n_tok - t_out_begin >= 2)) {

@@ -1,3 +1,57 @@
+> # 这是一个 fork，不是 Strata 本体
+>
+> 它只为一件事存在：交接一个**未完成**的实验——两张 RTX 3080 上的张量并行 `--tp 2`。
+> 分支 `tp2-wip` 基于 `296b59d2`（引擎 **0.1.44.1**）；上游项目在
+> [Niko1221/Strata](https://github.com/Niko1221/Strata)。
+>
+> **2026-10-19 更新：快路径的 non-finite logits 已修复**（提交 `7f55fd3`）——见
+> [交接文档](docs/TP2-HANDOVER.zh-CN.md) 的「已解决」一节。在同一台机器上与层切分做**等长**对比后，
+> 修复后的 TP=2 快路径**在所有测过的长度上追平层切分**（下表）。它仍被交接——因为有一个潜在时序 bug
+> （交接文档 0a 节）、未经人工 review、若干组合未测——而不是因为慢。
+>
+> English: [README.md](README.md)
+>
+> ## 速度（唯一需要记住的一张表）
+>
+> 同一批文档、专家缓存已热、`max_tokens=1`、客户端墙钟、同机同 pack，2026-10-19：
+>
+> | prompt 长度 | TP=2 快路径（修复后） | 层切分（PP） |
+> |---|---|---|
+> | ~11.7k token | 1 510–1 520 tok/s | 1 519–1 535 tok/s |
+> | 24.8k token | 1 907 tok/s | 1 904 tok/s |
+> | 123.6k token | **2 994 / 3 027 tok/s**（两次） | **2 987 / 3 046 tok/s**（两次） |
+> | 380k token | **2 993 tok/s**（预热阶梯） | **2 941 tok/s** |
+>
+> 两条路径的 prefill 速度都随长度**上升**（每请求约 1 秒的固定开销被摊薄、专家缓存跨 chunk 预热）——
+> 本文档历史上所有"TP 更慢"的数字都在比较不同长度；作者的 2900+ 就是同一条曲线的长上下文端
+> （live 观察 380k+ 处 3 248 tok/s 互证）。PCIe 不是瓶颈：123.6k 运行期间 `nvidia-smi dmon -s t` 采样为
+> 每卡均值 4–7 GB/s（Rx+Tx），峰值突发约 22。共享的天花板在 host 侧专家流水线（分组 + 流式），
+> 这就是两种方案收敛的原因。一个不对称未定论（交接 0b 节）：**冷启动** 380k prefill 在 TP 上慢约一倍——
+> 同样 6 338 槽，TP 摊 48 层（132/层）而层切分每级只管 24 层（264/层）；连跑两发冷 380k 热不起来，
+> 走 36k→124k→380k 阶梯则完全追平。
+> decode 强烈依赖上下文长度。180k 上下文下 TP 追平层切分（流式、250-token 分桶：TP 中位 **94.1** 对
+> PP **95.5**，min/max 相差 2% 以内），数 1→300 任务也追平（**194** 对 **191**，两边都正确）。作者的
+> 99.3 是层切分在 36k 的数——同一条曲线。有一个区间没有定论：短上下文散文 decode 测到 TP 140–155 对
+> PP 191.8，证据单薄且只有一侧（交接 0a 节）。verify 窗口路径（TP 默认、保留为安全兜底）仍是 37–52 tok/s。
+>
+> ## 细节全在文档里
+>
+> - **中文完整版：[docs/TP2-HANDOVER.zh-CN.md](docs/TP2-HANDOVER.zh-CN.md)** — 可复现的实测数据、
+>   完整证据链、13 项已排除假设与第 14 次定位修复、两阶段方案（990 → 2900 的算术）、两个真 bug、
+>   未测项、接手三步
+> - English: [docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md)
+> - 代码差异：[main...tp2-wip](https://github.com/ZeaMQ/Strata/compare/main...tp2-wip)（39 个文件）
+> - 上游 issue：[#3025](https://github.com/Niko1221/Strata/issues/3025)（本交接，已关闭）·
+>   [#156](https://github.com/Niko1221/Strata/issues/156)（当年以"暂不计划"关闭，本交接的实测支持那个判断）
+>
+> **来源：** AI 辅助，在**一次超过 400 轮对话、4 000 步工具调用**的会话中完成（会话自身计数），
+> **未经人工 review**；快速路径经过 **13 次**独立修复尝试仍未解决——第 14 次把 KV 池的读写双方逐一对账，
+> 找到了并修掉了。只编过 CUDA，未验证 HIP / SYCL。
+>
+> ---
+>
+> 以下为上游 README 的中文原文，未改动。
+
 <h1 align="center">Strata</h1>
 
 [English](README.md) · **简体中文** · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
