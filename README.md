@@ -1,8 +1,12 @@
 > # This is a fork, not Strata
 >
-> It exists for one thing: handing over an unfinished, **not usable** experiment — tensor parallel (`--tp 2`)
-> on two RTX 3080s. Branch `tp2-wip`, on top of `296b59d2` (engine **0.1.44.1**). Upstream is
+> It exists for one thing: handing over an unfinished experiment — tensor parallel (`--tp 2`) on two RTX
+> 3080s. Branch `tp2-wip`, on top of `296b59d2` (engine **0.1.44.1**). Upstream is
 > [Niko1221/Strata](https://github.com/Niko1221/Strata).
+>
+> **Update 2026-10-19: the fast path's `non-finite logits` is fixed** (commit `7f55fd3`) — see the
+> [handover](docs/TP2-HANDOVER.md), section "RESOLVED". The experiment is now **usable**, at about half
+> the layer split's prefill; it is handed over because it is still not worth the second card.
 >
 > 中文版本：[README.zh-CN.md](README.zh-CN.md)
 >
@@ -10,19 +14,20 @@
 >
 > | path | prefill | status |
 > |---|---|---|
-> | batched fast path (`STRATA_TP_FASTPROMPT=1`) | **860–990 tok/s** (peak 1012) | ❌ non-finite logits after N−5 tokens, **not usable** |
-> | verify windows (**default**) | **37–52 tok/s** | ✅ correct at every length measured |
+> | batched fast path (`STRATA_TP_FASTPROMPT=1`) | **1 187–1 519 tok/s** steady (warm expert cache; the first large prompt pays an ~86 s graph capture) | ✅ **fixed 2026-10-19** (`7f55fd3`): 2 803 / 5 533 / 11 176-token prompts all read in full, no non-finite; `12*7` → 84, reasoning answers correct end to end; decode ~90 tok/s |
+> | verify windows (**default**, kept as the safe fallback) | **37–52 tok/s** | ✅ correct at every length measured |
 > | layer split (original PP) | **2900+** (author's runs) / 2114.8 (this report, 36 329 tokens) | ✅ the target |
 > | one card (same 3 458-token prompt) | 397 tok/s | — |
 >
-> **The usable path is about 2% of the layer split. ~990 tok/s is one card's worth of work — the second card
-> buys almost nothing on prefill.**
+> **With the fix, TP prefill reaches ~50–70% of the layer split (1 519 vs 2 114–2 900) and decode ~90 vs
+> ~99 tok/s. The MoE stays replicated across ranks — every rank still evaluates the full expert set — which
+> is why TP cannot pass the split, and why this is still handed over.**
 >
 > ## Details live in the documents
 >
 > - **English handover: [docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md)** — reproducible measurements, the full
->   evidence chain, the 13 rejected hypotheses, the two-stage plan (990 → 2900 arithmetic), the two real bugs,
->   what was not tested, and the three steps to resume
+>   evidence chain, the 13 rejected hypotheses and the 14th pass that fixed it, the two-stage plan
+>   (990 → 2900 arithmetic), the two real bugs, what was not tested, and the three steps to resume
 > - 中文完整版: [docs/TP2-HANDOVER.zh-CN.md](docs/TP2-HANDOVER.zh-CN.md)
 > - diff: [main...tp2-wip](https://github.com/ZeaMQ/Strata/compare/main...tp2-wip) (39 files)
 > - upstream issues: [#3025](https://github.com/Niko1221/Strata/issues/3025) (this handover, closed) ·
@@ -31,7 +36,8 @@
 >
 > **Provenance:** AI-assisted in one long session that ran **over 400 assistant turns and 4 000 tool steps**
 > (the session's own counters), **not human-reviewed**; the fast path stayed unsolved through **13** separate
-> fix attempts. Only CUDA was built — HIP and SYCL are unverified.
+> fix attempts — the 14th, a full read/write ledger of every KV pool, found and fixed it. Only CUDA was
+> built — HIP and SYCL are unverified.
 >
 > ---
 >

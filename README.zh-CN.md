@@ -1,8 +1,12 @@
 > # 这是一个 fork，不是 Strata 本体
 >
-> 它只为一件事存在：交接一个**未完成、不可用**的实验——两张 RTX 3080 上的张量并行 `--tp 2`。
+> 它只为一件事存在：交接一个**未完成**的实验——两张 RTX 3080 上的张量并行 `--tp 2`。
 > 分支 `tp2-wip` 基于 `296b59d2`（引擎 **0.1.44.1**）；上游项目在
 > [Niko1221/Strata](https://github.com/Niko1221/Strata)。
+>
+> **2026-10-19 更新：快路径的 non-finite logits 已修复**（提交 `7f55fd3`）——见
+> [交接文档](docs/TP2-HANDOVER.zh-CN.md) 的「已解决」一节。实验现在是**可用**的，prefill 约为层切分的一半；
+> 仍然交接，是因为它依旧不值第二张卡。
 >
 > English: [README.md](README.md)
 >
@@ -10,25 +14,27 @@
 >
 > | 路径 | prefill | 状态 |
 > |---|---|---|
-> | batched 快路径（`STRATA_TP_FASTPROMPT=1`） | **860–990 tok/s**（峰值 1012） | ❌ 读完 N−5 个 token 后产生非有限 logits，**不可用** |
-> | verify 窗口路径（**默认**） | **37–52 tok/s** | ✅ 已测长度全部正确 |
+> | batched 快路径（`STRATA_TP_FASTPROMPT=1`） | 稳态 **1 187–1 519 tok/s**（专家缓存已热；首个大 prompt 付约 86 s 图捕获） | ✅ **2026-10-19 已修复**（`7f55fd3`）：2 803 / 5 533 / 11 176 token 全部完整读入、无非有限 logits；`12*7` → 84，思考与生成端到端正确；decode 约 90 tok/s |
+> | verify 窗口路径（**默认**，保留为安全兜底） | **37–52 tok/s** | ✅ 已测长度全部正确 |
 > | 层切分（原版 PP） | **2900+**（作者实测）／ 2114.8（本报告 36 329 token） | ✅ 目标 |
 > | 单卡（同一条 3 458-token prompt） | 397 tok/s | — |
 >
-> **能用的路径只有层切分的约 2%。~990 tok/s 只等于一张卡的产出——第二张卡在 prefill 上几乎没被用上。**
+> **修复后，TP 的 prefill 达到层切分的约 50–70%（1 519 对 2 114–2 900），decode 约 90 对 99 tok/s。
+> MoE 仍在两个 rank 上各算一遍——每个 rank 都评估全部专家——这就是 TP 超不过层切分的原因，也是它仍被交接的原因。**
 >
 > ## 细节全在文档里
 >
 > - **中文完整版：[docs/TP2-HANDOVER.zh-CN.md](docs/TP2-HANDOVER.zh-CN.md)** — 可复现的实测数据、
->   完整证据链、13 项已排除假设、两阶段方案（990 → 2900 的算术）、两个真 bug、未测项、接手三步
+>   完整证据链、13 项已排除假设与第 14 次定位修复、两阶段方案（990 → 2900 的算术）、两个真 bug、
+>   未测项、接手三步
 > - English: [docs/TP2-HANDOVER.md](docs/TP2-HANDOVER.md)
 > - 代码差异：[main...tp2-wip](https://github.com/ZeaMQ/Strata/compare/main...tp2-wip)（39 个文件）
 > - 上游 issue：[#3025](https://github.com/Niko1221/Strata/issues/3025)（本交接，已关闭）·
 >   [#156](https://github.com/Niko1221/Strata/issues/156)（当年以"暂不计划"关闭，本交接的实测支持那个判断）
 >
 > **来源：** AI 辅助，在**一次超过 400 轮对话、4 000 步工具调用**的会话中完成（会话自身计数），
-> **未经人工 review**；快速路径经过 **13 次**独立修复尝试仍未解决。
-> 只编过 CUDA，未验证 HIP / SYCL。
+> **未经人工 review**；快速路径经过 **13 次**独立修复尝试仍未解决——第 14 次把 KV 池的读写双方逐一对账，
+> 找到了并修掉了。只编过 CUDA，未验证 HIP / SYCL。
 >
 > ---
 >

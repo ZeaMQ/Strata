@@ -5,15 +5,49 @@ Everything below was measured on that tree; a different base commit may not appl
 
 **Provenance:** produced with AI assistance in one long session that ran **over 400 assistant turns and
 4 000 tool steps** (the session's own counters), **not human-reviewed**. The fast path described in 4 stayed
-unsolved through thirteen separate fix attempts. Treat it as a bug report with a patch
+unsolved through thirteen separate fix attempts; the fourteenth — writing down every allocator, writer and
+reader of the three KV pools in one table — found it. Treat it as a bug report with a patch
 attached, not as a submission.
 
-**Status:半成品 / half-finished.** A dual-GPU tensor-parallel path exists and is *correct* for every
-prompt length I measured, but its fast prompt path is still broken, so it is **slower than the existing
-layer split, not faster**. This document is a handover: what works, what does not, the exact evidence I
-collected, and the three steps I would try next. Please do not ship this as-is.
+**Status: half-finished, but usable.** A dual-GPU tensor-parallel path exists and is *correct* for every
+prompt length I measured. Its fast prompt path was broken when this document was first published and is
+**fixed as of 2026-10-19** (commit `7f55fd3`, section 0): prefill now runs at 1 187–1 519 tok/s, about half
+the layer split's, so the experiment is usable but still does not beat the split. Sections 4, 4a and 5 are
+kept as the record of the search. Please do not ship this as-is.
 
 If a thread for tensor parallelism already exists, merge this report into it instead of opening a new one.
+
+---
+
+## 0. RESOLVED (2026-10-19): the fast path's non-finite logits — root cause and fix
+
+Commit `7f55fd3` ("fix(TP): the batched prompt path's K/V append wrote the model's page stride into the
+rank's pools"). Everything in sections 4, 4a and 5 below is the record of the search; the search ended here.
+
+**Root cause, in one paragraph.** The batched prompt path's only inconsistent component was its K/V writer.
+The resident slots, the pinned host copy and the staging pool are all allocated with `qsa_shapes_rank`
+(one K/V head per page at TP=2), and every reader — the attention kernels (`(page * n_kv_heads + kvh) *
+page_size`), `kv_stream`'s block runs, the gather and the decode kernels — addresses that stride.
+`kv_append_kernel` was still writing with the model's 2 heads per page and the rank's GLOBAL head offset:
+every row landed at twice the offset the readers used, and for the rank's upper pages past the pool's end.
+The attention then read never-written rows; an INT8 row that was never written has scale 0 and the dequant
+divides by it — 0/0 — so the first QSA layer's attention went non-finite and #879 fired at the end of the
+prompt. The verify-window path never calls this kernel, which is why it was always correct.
+
+**Why thirteen attempts missed it.** Each changed one side of a pair and left the other. Writing `page*1`
+while `head_base` was still global moved rank 1's rows into rank 0's next page — that is the measured
+"100 % non-finite, max |x| 0" reversal in section 5, and it wrongly cleared the writer of suspicion. The fix
+fell out of the ledger, not of another probe.
+
+**Measured after the fix** (same machine, same config, `STRATA_TP_FASTPROMPT=1`, warm expert cache): prompts
+of 2 803 / 5 533 / 11 176 tokens all read in full, no non-finite anywhere in the engine log; 1 187 and
+1 519 tok/s steady state (the first large prompt pays an ~86 s graph capture); decode ~90 tok/s; `12*7`
+answers `84`, and the summarize/reasoning answers are coherent and correct end to end. The fast path is now
+the path I would use; the verify windows stay the default and the safe fallback.
+
+**Still true after the fix:** the MoE is replicated, so TP prefill (~1.5 K) stays below the layer split
+(2.1–2.9 K) — the stage-2 analysis in 4a is unchanged. Still untested: the Q4_0 and K8V4 batched appends
+(they still take the model's shapes), HIP, SYCL, long multi-turn sessions.
 
 ---
 
@@ -80,6 +114,8 @@ So the correct TP path is about **2 % of the layer split's prompt throughput**. 
 this patch does not advance speed.
 
 ## 4. What does not work
+
+> **Resolved 2026-10-19 — see section 0.** Kept below as the record of the search.
 
 The fast path (`STRATA_TP_FASTPROMPT=1`, one batched prefill instead of 6-token verify windows) reaches
 **860–990 tok/s** on the same prompts but produces non-finite logits:
