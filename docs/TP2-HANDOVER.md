@@ -118,6 +118,47 @@ long multi-turn sessions.
 
 ---
 
+## 0c. Modularization status (what moved where, and what is left)
+
+To keep future rebases cheap, TP-specific code is being consolidated into TP-owned files so upstream files
+carry only one-to-three-line seams. Done on `296b59d2` (commits `f44c3d53..7975da45`, each "pure move,
+behavior unchanged", Release build clean after every step):
+
+- `include/strata/tp/dims.hpp` - THE one home for `gdn_v_heads_rank` / `gdn_channels_rank` / `gdn_k_heads_rank`
+  / `qsa_shapes_rank` (were three drifting copies in session.cpp/prefill.cpp/verify.cpp/layer.cpp; each file
+  keeps a one-line `using`). The header says why: the KV page-stride bug (section 0) is what a copy drifting
+  causes.
+- `serve/tp_config.py` - `tp_of` / `tp_value` / `tp_extra_args` / `tp_startup_check`; server.py keeps one
+  import + 3 one-line seams + the `and not tp_of(cfg)` condition. The 4 `TensorParallel` tests pass.
+- `include/strata/core/tp_runtime.hpp` - `allow_gdn_split()` (the STRATA_GDN_SPLIT pair-gate, was a lambda in
+  `verify_kernels.cu`) and `tp_owed_reduce()` (the null-test + reduce contract, was a 3-4 line block at 4
+  sites in layer.cpp/prefill.cpp; verify.cpp's 2 sites still inline, entangled with probes).
+- `src/tp/tp_diag.cpp` + `include/strata/tp/tp_diag.hpp` - the TPDIAG device log (330 lines off
+  verify.cpp's head); the scattered probes stay in verify.cpp as seams. Dead helpers dropped.
+
+Still open (deliberately deferred to AFTER the rebase onto the new upstream, where they will be done once
+against the new base instead of twice):
+
+1. `generate.cpp` hunk "rank 1 mirror construction" (~198 contiguous lines in the serve block): move to
+   `src/tp/tp_rank1.cpp` + `include/strata/tp/tp_rank1.hpp` as `bool build_rank1(TpRank1Inputs&, err)`.
+   Prerequisites: hoist the function-local `PfPart` struct (main, ~line 7517) and the `part_bytes` lambda
+   (~7537) to file scope; pack the ~22 closed-over main locals (o-fields, g, skip, native_head,
+   native_shards, native_head_shards, n_vocab, batch_mtp, xcache, sized_slots, vh, ss, ple_table1,
+   ple_emb_host1, sp.chunk, host_res, prefill_src, pf_parts, part_bytes, and the owned tp1/tp_pair/rt0/rt1/
+   head1/sp1/sp1_valid) into the inputs struct; unify the DOUBLE declaration of tp1/tp_pair/tp_rt0/tp_rt1
+   (main scope ~3735 and serve scope ~8206, the second shadows the first).
+2. `generate.cpp` window runners (prompt-window ~85 lines, run_chunk ~32, decode-window ~48): move to
+   `src/tp/tp_windows.cpp` behind a `TpWindowCtx` (ver, tp1, tp_rt0/1, Drive&, win_pool_fn/user, g, o.tp).
+   `Drive` is anon-namespace - hoist it to file scope (POD struct, no ODR risk).
+3. `generate.cpp` TP statics `g_tp_free_bytes` / `g_tp_pool_serialise` / `g_tp_pool_mutex` -> `src/tp/
+   tp_state.cpp` with accessors (`free_bytes_for_sizing()`, `set_pool_serialise()`, RAII `pool_guard`).
+4. verify.cpp scattered probes -> one-line `tpdiag_*` calls (the header already documents this as the N-5
+   follow-up; the probe functions take exactly the pointers their site reads).
+5. weights.cpp `RowShard`/`row_shard` (60 lines) -> `src/tp/weights_shard.cpp` IF `IndexRow`/`Conv`/`Seg`
+   (file-local) are exposed; otherwise keep as load()/pool_bytes() seams - accepted as-is.
+6. `generate.cpp`'s `--tp` startup refusal (~26 code lines) -> `tp_rules_glue.cpp` once Options is
+   exportable or mirrored as a TP-local POD.
+
 ## 1. What this is
 
 Strata today runs multi-GPU by **splitting layers** (`--pipeline-windows 2`, `layer_split: auto`): each card

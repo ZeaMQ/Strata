@@ -98,6 +98,41 @@ native IQ pack 上**无效**（引擎要求 `--spec T (T >= 2)`，spec 0 会落�
 
 ---
 
+## 0c. 模块化进度（搬了什么、还剩什么）
+
+为了让以后的 rebase 便宜，TP 专属代码正集中到 TP 自有文件，上游文件只留一到三行接缝。已在 `296b59d2`
+上完成（提交 `f44c3d53..7975da45`，每个都是"纯移动、行为不变"，每步 Release 编译干净）：
+
+- `include/strata/tp/dims.hpp`——`gdn_v_heads_rank`/`gdn_channels_rank`/`gdn_k_heads_rank`/`qsa_shapes_rank`
+  的**唯一之家**（原来在 session.cpp/prefill.cpp/verify.cpp/layer.cpp 里有三份会漂移的副本；各文件留一行
+  `using`）。头文件写明了为什么：KV 页 stride bug（第 0 节）就是一份副本漂移造成的。
+- `serve/tp_config.py`——`tp_of`/`tp_value`/`tp_extra_args`/`tp_startup_check`；server.py 只剩一个 import +
+  三个一行接缝 + `and not tp_of(cfg)` 条件。4 个 `TensorParallel` 测试全过。
+- `include/strata/core/tp_runtime.hpp`——`allow_gdn_split()`（STRATA_GDN_SPLIT 的双卡门控，原来是
+  verify_kernels.cu 里的 lambda）和 `tp_owed_reduce()`（null 测试 + reduce 契约，原来是 layer.cpp/prefill.cpp
+  里 4 处的 3-4 行块；verify.cpp 的 2 处因与探针绞缠暂留）。
+- `src/tp/tp_diag.cpp` + `include/strata/tp/tp_diag.hpp`——TPDIAG 设备日志（verify.cpp 头部减 330 行）；
+  散落探针留在 verify.cpp 当接缝。死代码直接删了。
+
+**未做**（有意推迟到 rebase 到新上游**之后**——在新基座上只做一遍，而不是两遍）：
+
+1. `generate.cpp` 的"rank 1 镜像构造"（serve 块里连续 ~198 行）→ `src/tp/tp_rank1.cpp` +
+   `include/strata/tp/tp_rank1.hpp` 的 `bool build_rank1(TpRank1Inputs&, err)`。前置：把函数内的 `PfPart`
+   （main ~7517 行）和 `part_bytes` lambda（~7537）提升到文件作用域；把 ~22 个被闭合的 main 局部打包进
+   inputs 结构；统一 tp1/tp_pair/tp_rt0/tp_rt1 的**双重声明**（main 作用域 ~3735 与 serve 作用域 ~8206，
+   后者遮蔽前者）。
+2. `generate.cpp` 三个窗口运行器（prompt-window ~85 行、run_chunk ~32、decode-window ~48）→
+   `src/tp/tp_windows.cpp`，接口 `TpWindowCtx`（ver、tp1、tp_rt0/1、Drive&、win_pool_fn/user、g、o.tp）。
+   `Drive` 在匿名 namespace——提到文件作用域（POD 结构，无 ODR 风险）。
+3. `generate.cpp` 的 TP 静态 `g_tp_free_bytes`/`g_tp_pool_serialise`/`g_tp_pool_mutex` → `src/tp/tp_state.cpp`
+   加访问器（`free_bytes_for_sizing()`、`set_pool_serialise()`、RAII `pool_guard`）。
+4. verify.cpp 散落探针 → 一行 `tpdiag_*` 调用（头文件已注明这是 N−5 的后续；探针函数按各站点实际读的
+   指针收参）。
+5. weights.cpp 的 `RowShard`/`row_shard`（60 行）→ `src/tp/weights_shard.cpp`，前提是暴露文件内的
+   `IndexRow`/`Conv`/`Seg`；否则保持 load()/pool_bytes() 接缝——已接受现状。
+6. `generate.cpp` 的 `--tp` 启动拒绝（~26 行代码）→ Options 可导出或镜像成 TP 本地 POD 后搬进
+   `tp_rules_glue.cpp`。
+
 ## 1. 这是什么
 
 Strata 目前的多卡方式是**切层**（`--pipeline-windows 2`、`layer_split: auto`）：每张卡拥有整层，
