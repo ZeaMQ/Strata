@@ -58,11 +58,26 @@ not why it was slower — it is not. Decode: TP ~90 vs PP ~99 tok/s.
 
 ## 0a. One latent bug found while probing the ceiling
 
-`--pool-workers 5` (instead of 11) reproduces the ORIGINAL symptom — `non-finite logits (#879) in a prompt
-window at position N-5` — on the fixed build, three runs in a row, while 11 workers is clean. So a timing-
-dependent defect remains in the fast path; the default worker count hides it. Not investigated further
-(this session's budget); the first thing to try is `STRATA_DBG_GDN=1` under `--pool-workers 5` to catch the
-first non-finite step. Do not lower pool workers on a TP build until this is understood.
+The N-5 defect is NOT fully dead - the default settings hide it, two switches expose it:
+
+- `--pool-workers 5` (instead of 11): reproduced `non-finite logits (#879) at position N-5` three runs in a row.
+- `--adapt-async 1`: reproduced it DETERMINISTICALLY (4 requests in a row, both ranks, positions 110-111 of a
+  115-token prompt) - and the tier's own line says `0 rounds, 0 experts swapped in`, so the trigger is the
+  asynchronous tier's PRESENCE (its exchange buffers / wait flags / extra allocations), not the swapping.
+  The gate accepts `--adapt-async` under TP (`adaptive tier asynchronous ... arena: copy-in only`) - do not
+  use it on a TP build until this is understood.
+- Once, with the DEFAULT settings, the very first post-boot request that ran a decode (112-token prompt,
+  512 generated) hit #879 twice and returned 503; the next boot's first such request was clean, and a retry
+  after the 503 always succeeded. So the exposure is timing/memory-layout sensitive, not worker-count
+  specific.
+
+Decode, measured by slope (same prompt at 64 and 576 tokens, prefill and fixed cost cancel), at SHORT
+context (~110-690 tokens): TP fast path **140-155 tok/s** vs a freshly restarted layer split **191.8 tok/s**.
+(Section 3's 99.3 tok/s is the split's decode at 36k context - decode falls as context grows, so the two
+figures are both right at their own lengths.) The earlier ~90 / 45.9 figures were a contaminated estimate and
+the verify-window path. First-request decode after boot pays ~120 s of window graph capture. Not investigated
+further (this session's budget); the first thing to try is `STRATA_DBG_GDN=1` under `--adapt-async 1` to
+catch the first non-finite step.
 
 **Still untested:** the Q4_0 and K8V4 batched appends (they still take the model's shapes), HIP, SYCL,
 long multi-turn sessions.

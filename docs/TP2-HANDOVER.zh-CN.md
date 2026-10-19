@@ -49,10 +49,21 @@ TP 为什么超不过层切分，而不是它为什么更慢——它不慢。de
 
 ## 0a. 追天花板时发现的另一个潜在 bug
 
-在修复后的构建上，`--pool-workers 5`（代替 11）会**连续三次复现原始症状**——`non-finite logits (#879)
-in a prompt window at position N-5`——而 11 workers 干净。说明快路径里还残留一个时序相关的缺陷，
-默认的 worker 数只是恰好掩盖了它。本次会话预算内未继续排查；第一步是在 `--pool-workers 5` 下开
-`STRATA_DBG_GDN=1` 抓第一个 non-finite 的步骤。在搞清之前，TP 构建上不要调低 pool workers。
+N−5 缺陷**没有死透**——默认配置掩盖它，两个开关能暴露它：
+
+- `--pool-workers 5`（代替 11）：连续三次复现 `non-finite logits (#879) at position N-5`。
+- `--adapt-async 1`：**确定性复现**（连续 4 个请求、两个 rank、115-token prompt 的 110-111 位）——而它自己的
+  日志写着 `0 rounds, 0 experts swapped in`，请求在攒够 4 个窗口前就死了。所以触发器是异步层的**存在本身**
+  （它的 exchange buffer / 等待标志 / 额外分配），不是"转移"这个动作。门控在 TP 下**接受** `--adapt-async`
+  （日志：`adaptive tier asynchronous ... arena: copy-in only`）——搞清之前不要在 TP 构建上用它。
+- 还有一次，**默认配置**下启动后第一个带 decode 的请求（112-token prompt、生成 512）连续两次 #879 返回 503；
+  下一次启动的同类请求却干净，503 之后重试总能成功。所以暴露方式是时序/内存布局敏感，不是 worker 数特异。
+
+decode 用斜率法测（同 prompt 跑 64 与 576 token，prefill 与固定开销相消），在**短上下文**（~110–690 token）下：
+TP 快路径 **140–155 tok/s**，刚重启的层切分 **191.8 tok/s**。（第 3 节的 99.3 是层切分在 36k 上下文下的
+decode——上下文越长 decode 越慢，两个数在各自长度上都对。）之前的 ~90 / 45.9 分别是被污染的估算和 verify
+窗口路径。启动后首个 decode 请求付约 120 s 的窗口图捕获。本次会话预算内未继续排查；第一步是在
+`--adapt-async 1` 下开 `STRATA_DBG_GDN=1` 抓第一个 non-finite 的步骤。
 
 **仍未测：** Q4_0 / K8V4 的 batched append（它们还在用模型级形状）、HIP、SYCL、长时间多轮会话。
 
