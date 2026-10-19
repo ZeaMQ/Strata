@@ -20,9 +20,24 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 
+#include "strata/core/shard.hpp"   // tp_ranks_current
+
 namespace strata::core {
+
+/// STRATA_GDN_SPLIT=1 asks for the 4-block re-cut of each head's state columns in `gdn_step_norm_multi`;
+/// a tensor-parallel PAIR refuses it by default - the re-cut is not the geometry a rank owns (24 heads,
+/// its own state block).  Measured on a pair with the long answer as the judge: with the split on, a
+/// telegraphic word salad ('user ask: say hello to the person. user ask: take create annotation chat not
+/// append system do review model nuclear programming challenge...'); with it off, complete sentences.
+/// Turning off the neighbouring GDN kernels as well made it worse (3 distinct of 8 against 2), so this
+/// one is the difference.  One card is unaffected: tp_ranks_current() is 1 there and the split still runs.
+inline bool allow_gdn_split() {
+    const char* v = std::getenv("STRATA_GDN_SPLIT");
+    return v != nullptr && v[0] == '1' && tp_ranks_current() <= 1;
+}
 
 /// TPDIAG (temporary): the stream the current verify window runs on, published by `Verifier::record_window`.
 /// The no-MoE diagnostic zeroes a buffer INSIDE that window, and a capture only accepts work on its own stream -
