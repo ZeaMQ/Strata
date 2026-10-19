@@ -45,9 +45,27 @@ of 2 803 / 5 533 / 11 176 tokens all read in full, no non-finite anywhere in the
 answers `84`, and the summarize/reasoning answers are coherent and correct end to end. The fast path is now
 the path I would use; the verify windows stay the default and the safe fallback.
 
-**Still true after the fix:** the MoE is replicated, so TP prefill (~1.5 K) stays below the layer split
-(2.1–2.9 K) — the stage-2 analysis in 4a is unchanged. Still untested: the Q4_0 and K8V4 batched appends
-(they still take the model's shapes), HIP, SYCL, long multi-turn sessions.
+**Correction the same day — equal-length comparison.** The "~1.5 K vs 2.1–2.9 K" gap quoted above compared
+different prompt lengths. Running the SAME documents through both paths on this machine (warm expert cache,
+`max_tokens=1`, client-side wall clock, 2026-10-19): ~11.7k tokens TP 1 510–1 520 vs PP 1 519–1 535;
+24.8k TP 1 907 vs PP 1 904; 123.6k TP **2 994** vs PP **2 987**. The fixed fast path MATCHES the layer
+split at every length measured, and the author's 2900+ is the long-context end of the same rising curve
+(both paths: ~1 s fixed per-request cost amortizes and the expert cache warms across chunks). `nvidia-smi
+dmon -s t` during the 123.6k run: 4–7 GB/s mean per card (Rx+Tx), ~22 GB/s peak bursts — PCIe is not
+saturated. The shared ceiling is the host-side expert pipeline (grouping + streaming), which is why the two
+schemes converge; the stage-2 "halve the expert work" analysis in 4a explains why TP cannot BEAT the split,
+not why it was slower — it is not. Decode: TP ~90 vs PP ~99 tok/s.
+
+## 0a. One latent bug found while probing the ceiling
+
+`--pool-workers 5` (instead of 11) reproduces the ORIGINAL symptom — `non-finite logits (#879) in a prompt
+window at position N-5` — on the fixed build, three runs in a row, while 11 workers is clean. So a timing-
+dependent defect remains in the fast path; the default worker count hides it. Not investigated further
+(this session's budget); the first thing to try is `STRATA_DBG_GDN=1` under `--pool-workers 5` to catch the
+first non-finite step. Do not lower pool workers on a TP build until this is understood.
+
+**Still untested:** the Q4_0 and K8V4 batched appends (they still take the model's shapes), HIP, SYCL,
+long multi-turn sessions.
 
 ---
 

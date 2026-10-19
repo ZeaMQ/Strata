@@ -5,23 +5,30 @@
 > [Niko1221/Strata](https://github.com/Niko1221/Strata).
 >
 > **Update 2026-10-19: the fast path's `non-finite logits` is fixed** (commit `7f55fd3`) — see the
-> [handover](docs/TP2-HANDOVER.md), section "RESOLVED". The experiment is now **usable**, at about half
-> the layer split's prefill; it is handed over because it is still not worth the second card.
+> [handover](docs/TP2-HANDOVER.md), section "RESOLVED". Measured at EQUAL prompt lengths against the layer
+> split on this machine, the fixed TP=2 fast path **matches it at every length measured** (table below).
+> It is still handed over — one latent timing bug (handover section 0a), no human review, several untested
+> combinations — but not because it is slow.
 >
 > 中文版本：[README.zh-CN.md](README.zh-CN.md)
 >
 > ## Speed (the one table worth remembering)
 >
-> | path | prefill | status |
-> |---|---|---|
-> | batched fast path (`STRATA_TP_FASTPROMPT=1`) | **1 187–1 519 tok/s** steady (warm expert cache; the first large prompt pays an ~86 s graph capture) | ✅ **fixed 2026-10-19** (`7f55fd3`): 2 803 / 5 533 / 11 176-token prompts all read in full, no non-finite; `12*7` → 84, reasoning answers correct end to end; decode ~90 tok/s |
-> | verify windows (**default**, kept as the safe fallback) | **37–52 tok/s** | ✅ correct at every length measured |
-> | layer split (original PP) | **2900+** (author's runs) / 2114.8 (this report, 36 329 tokens) | ✅ the target |
-> | one card (same 3 458-token prompt) | 397 tok/s | — |
+> Same documents, warm expert cache, `max_tokens=1`, client-side wall clock, same box and pack, 2026-10-19:
 >
-> **With the fix, TP prefill reaches ~50–70% of the layer split (1 519 vs 2 114–2 900) and decode ~90 vs
-> ~99 tok/s. The MoE stays replicated across ranks — every rank still evaluates the full expert set — which
-> is why TP cannot pass the split, and why this is still handed over.**
+> | prompt length | TP=2 fast path (fixed) | layer split (PP) |
+> |---|---|---|
+> | ~11.7k tokens | 1 510–1 520 tok/s | 1 519–1 535 tok/s |
+> | 24.8k tokens | 1 907 tok/s | 1 904 tok/s |
+> | 123.6k tokens | **2 994 tok/s** | **2 987 tok/s** |
+>
+> Prefill speed RISES with prompt length on both paths (a ~1 s fixed per-request cost amortizes and the
+> expert cache warms across chunks) — every earlier "TP is slower" number in this document's history
+> compared different lengths; the author's 2900+ is the long-context end of the same curve. PCIe is not
+> the limit: `nvidia-smi dmon -s t` during the 123.6k run gives 4–7 GB/s mean per card (Rx+Tx) against
+> ~22 GB/s peak bursts. The shared ceiling is the host-side expert pipeline (grouping + streaming), which
+> is why the two schemes converge. Decode: TP ~90 vs PP ~99 tok/s. The verify-window path (the TP default,
+> kept as the safe fallback) stays at 37–52 tok/s.
 >
 > ## Details live in the documents
 >
