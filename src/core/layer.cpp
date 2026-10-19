@@ -379,9 +379,7 @@ st_begin(layer, 15, stream);
     }    if (!gemv_quantized(*w_out, p_out, f_out, b.y_q8_0 + koff.q8_0, b.y_q8k + koff.q8k, out, k_n, g.n_embd,                        v.name("ssm_out.weight"), stream, err, b.y + koff.scalars)) return false;
     // ... and the second half of the partial sum, if a TP rank is installed (null on a single-card run, where
     // nothing is owed and `out` is already the whole projection).  See core/tp_runtime.hpp.
-    if (strata::core::TpRuntime* tp = strata::core::TpRuntime::current()) {
-        if (!tp->reduce(out, g.n_embd, stream, err)) return false;
-    }
+    if (!strata::core::tp_owed_reduce(out, g.n_embd, stream, err)) return false;
     st_end(layer, 15, stream);    return true;}
 // ================================ the MoE block ================================
 uint64_t moe_buffers_bytes(const ModelGeometry& g, int64_t k) {    const uint64_t parts[] = {        (uint64_t) g.n_embd * 2,
@@ -1243,9 +1241,7 @@ try {
                     ao_n, g.n_embd, f_o, stream);
 }
     // the same owed all-reduce as `ssm_out` above: this rank has half of the contraction axis
-    if (strata::core::TpRuntime* tp = strata::core::TpRuntime::current()) {
-        if (!tp->reduce(out, g.n_embd, stream, err)) return false;
-    }
+    if (!strata::core::tp_owed_reduce(out, g.n_embd, stream, err)) return false;
     return true;}
 // ================================ THE DOORBELL ================================
 namespace {}

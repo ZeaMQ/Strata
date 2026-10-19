@@ -67,4 +67,13 @@ private:
     inline static thread_local TpRuntime* current_ = nullptr;
 };
 
+/// The all-reduce a tensor-parallel rank OWES at a contraction point (`ssm_out`, `attn_output`): add the
+/// peer's partial sum INTO `y` (`n` floats) on `stream`.  True with nothing done on a single-card run,
+/// where `current()` is null and `y` is already the whole projection.  False means "fail this request":
+/// a rank that cannot reduce must not carry on with half a sum, because the result would look plausible.
+inline bool tp_owed_reduce(float* y, int64_t n, void* stream, std::string& err) {
+    TpRuntime* tp = TpRuntime::current();
+    return tp == nullptr || tp->reduce(y, n, stream, err);
+}
+
 }  // namespace strata::core

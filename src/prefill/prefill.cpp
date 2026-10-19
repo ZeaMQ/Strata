@@ -2755,11 +2755,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
                     dbg_gdn(l, "bo(ssm_out)", m.bo, T * g.n_embd, m.cs);
                     // TENSOR PARALLEL: `ssm_out` contracts over the v heads, so this is a PARTIAL sum - the peer's
-                    // half is added before the next layer reads `bo_`.  On one card `TpRuntime::current()` is null.
-                    if (strata::core::TpRuntime* tp = strata::core::TpRuntime::current()) {
-                        if (!tp->reduce(m.bo, (int64_t) T * (int64_t) g.n_embd, m.cs, err)) return false;
-                        dbg_gdn(l, "bo(reduce)", m.bo, T * g.n_embd, m.cs);
-                    }
+                    // half is added before the next layer reads `bo_`.  On one card the runtime is null.
+                    if (!strata::core::tp_owed_reduce(m.bo, (int64_t) T * (int64_t) g.n_embd, m.cs, err)) return false;
+                    dbg_gdn(l, "bo(reduce)", m.bo, T * g.n_embd, m.cs);
                     ++gdn_index;
                 } else if (half == 0) {
                     // ======================= QSA =======================
@@ -3027,10 +3025,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     dbg_gdn(l, "qsa bo(proj)", m.bo, T * g.n_embd, m.cs);
                     // TENSOR PARALLEL: `attn_output` contracts over the head width, so this is a PARTIAL sum - the
                     // peer's half is added before the next layer reads `bo_`.  On one card the runtime is null.
-                    if (strata::core::TpRuntime* tp = strata::core::TpRuntime::current()) {
-                        if (!tp->reduce(m.bo, (int64_t) T * (int64_t) g.n_embd, m.cs, err)) return false;
-                        dbg_gdn(l, "qsa bo(reduce)", m.bo, T * g.n_embd, m.cs);
-                    }
+                    if (!strata::core::tp_owed_reduce(m.bo, (int64_t) T * (int64_t) g.n_embd, m.cs, err)) return false;
+                    dbg_gdn(l, "qsa bo(reduce)", m.bo, T * g.n_embd, m.cs);
                     ++qsa_index;
                     if (!kv_prefetch_after(l + 1, qsa_index)) return false;
                 } else {
