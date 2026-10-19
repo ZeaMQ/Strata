@@ -27,9 +27,12 @@
 > compared different lengths; the author's 2900+ is the long-context end of the same curve. PCIe is not
 > the limit: `nvidia-smi dmon -s t` during the 123.6k run gives 4–7 GB/s mean per card (Rx+Tx) against
 > ~22 GB/s peak bursts. The shared ceiling is the host-side expert pipeline (grouping + streaming), which
-> is why the two schemes converge. Decode, measured by slope (same prompt at 64 and 576 tokens): TP
-> **140–155** vs PP **191.8** tok/s on a fresh session. The verify-window path (the TP default,
-> kept as the safe fallback) stays at 37–52 tok/s.
+> is why the two schemes converge. Decode depends strongly on context length. TP matches the split at
+> 180k context (streamed, 250-token buckets: TP median **94.1** vs PP **95.5**, min/max within 2%) and on
+> the counting task 1→300 (TP **194** vs PP **191**, both correct). The author's 99.3 is the split at 36k -
+> the same curve. One regime is unsettled: short-context prose decode measured TP 140-155 vs PP 191.8 on
+> thin, one-sided evidence (handover 0a). The verify-window path (the TP default, kept as the safe
+> fallback) stays at 37–52 tok/s.
 >
 > ## Details live in the documents
 >

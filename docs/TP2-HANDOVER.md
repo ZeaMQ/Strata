@@ -71,13 +71,21 @@ The N-5 defect is NOT fully dead - the default settings hide it, two switches ex
   after the 503 always succeeded. So the exposure is timing/memory-layout sensitive, not worker-count
   specific.
 
-Decode, measured by slope (same prompt at 64 and 576 tokens, prefill and fixed cost cancel), at SHORT
-context (~110-690 tokens): TP fast path **140-155 tok/s** vs a freshly restarted layer split **191.8 tok/s**.
-(Section 3's 99.3 tok/s is the split's decode at 36k context - decode falls as context grows, so the two
-figures are both right at their own lengths.) The earlier ~90 / 45.9 figures were a contaminated estimate and
-the verify-window path. First-request decode after boot pays ~120 s of window graph capture. Not investigated
-further (this session's budget); the first thing to try is `STRATA_DBG_GDN=1` under `--adapt-async 1` to
-catch the first non-finite step.
+Decode depends strongly on context length. At 180k context with 3000 generated tokens (pt=180 127, streamed,
+per-250-token buckets) TP median **94.1** / min 85.4 / max 100.9 vs PP **95.5** / 84.9 / 103.7 - a match,
+distributions overlapping. On the counting task (1→300, pt=78, ct=2048) TP **194.4** / 119 / 220 vs PP
+**191.3** / 116 / 220 - also a match, both reach 300 correctly. The author's 99.3 is the split at 36k - the
+same curve. One regime is NOT settled: on the short explanatory prompt, the slope method measured TP
+**140-155** (two warmed samples) vs PP **191.8** (one sample, and its 64-token endpoint was the first
+request after boot, which biases the PP figure UP). So short-context prose decode is the one place where
+TP measured below the split, on thin evidence - re-measure both sides warmed before believing either
+number. The max of ~220 is MTP at full acceptance on
+a counting sequence; the min is the thinking-to-answer transition. First-request decode after boot pays
+~120 s of window graph capture, and the first large prompt pays ~90-140 s of prefill-graph capture - more
+on the TP build than on the split, which is why first-request wall times differ (228.9 s vs 90.6 s at
+180k+3000) while the warm steady state matches (fixtest7: 2 994 vs 2 987 at 123.6k). Not investigated
+further (this session's budget); the first thing to try for 0a is `STRATA_DBG_GDN=1` under `--adapt-async 1`
+to catch the first non-finite step.
 
 **Still untested:** the Q4_0 and K8V4 batched appends (they still take the model's shapes), HIP, SYCL,
 long multi-turn sessions.
