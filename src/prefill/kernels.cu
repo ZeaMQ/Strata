@@ -1685,13 +1685,20 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
     const bool is_v = (blockIdx.z & 1) != 0;
     const int d = g * 64 + threadIdx.x;
     // TENSOR PARALLEL: this rank's K/V buffer is [T, heads, 256] (heads = n_head_kv / tp_ranks) - the projection
-    // wrote only the rank's heads - so the stride is the rank's `heads`.  The PAGE keeps the model's full
-    // n_head_kv heads, so the rank writes at its own global head offset (`head_base`).
+    // wrote only the rank's heads - so the stride is the rank's `heads`.  ALL THREE destinations keep the same
+    // rank-local page layout: the resident slots and the host copy are allocated from `qsa_shapes_rank`
+    // (`layer.cpp:765/860`, rows = pages * n_head_kv_rank * page_size) and so is the staging pool the attention
+    // reads; every reader - the attention kernels (`(page * n_kv_heads + kvh) * page_size`, fed the rank shape),
+    // `kv_stream` (rows per block = n_head_kv_rank * page_size) and the gather/decode kernels - addresses that
+    // stride.  `kvfull` is therefore the POOL's heads-per-page, not the model's: a rank passes its own count
+    // with `head_base` 0.  Writing the model's 2 here put every row at twice the offset the readers used, past
+    // the pool's end for the rank's second half of the pages: the reads hit never-written rows, whose INT8
+    // scale 0 made the dequant divide 0/0 - non-finite attention output from the first QSA layer on.
     const float x = (is_v ? V : K)[t * (heads * 256) + kvh * 256 + d];
     const int64_t pos = pos0 + t;
     const int64_t page = table[pos / page_size];
-    const int64_t row = (page * 2 + (head_base + kvh)) * page_size + pos % page_size;
-    const int64_t row_id = ((pos / page_size) * 2 + (head_base + kvh)) * page_size + pos % page_size;
+    const int64_t row = (page * kvfull + (head_base + kvh)) * page_size + pos % page_size;
+    const int64_t row_id = ((pos / page_size) * kvfull + (head_base + kvh)) * page_size + pos % page_size;
     if (k_pool != nullptr) {
         const uint16_t h = hf(x);
         if (page >= 0) (is_v ? v_pool : k_pool)[row * 256 + d] = h;

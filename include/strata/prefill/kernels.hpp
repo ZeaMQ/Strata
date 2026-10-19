@@ -136,9 +136,10 @@ void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t 
 
 /// K and V of T consecutive cells (positions pos0..pos0+T-1; K normed and rotated) into the paged pools: FP16
 /// (`k_pool`/`v_pool`) or INT8 codes + FP16 scale per 64 (`k_q`...), the decode append's arithmetic.
-/// K, V: [T, kvfull, 256] - the caller's buffer keeps the model's FULL head count (`kvfull`), the rank's share sits at
-/// `head_base`.  `heads` is the RANK's K/V head count (`n_head_kv / tp_ranks`), `head_base` the rank's first global
-/// head, and the page keeps the model's full `n_head_kv` heads.  Single card: heads=kvfull=2, head_base=0.
+/// K, V: [T, heads, 256] - the caller's buffer holds exactly the heads it projected, packed at `heads * 256`.
+/// `heads` is the RANK's K/V head count (`n_head_kv / tp_ranks`), and `kvfull` is the POOL's heads-per-page:
+/// every destination (resident slots, host copy, staging pool) is allocated with the SAME rank-local page
+/// layout, so a rank passes `kvfull = heads` with `head_base = 0`.  Single card: heads=kvfull=2, head_base=0.
 void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
                void* stream, const strata::kernels::KvHostPools* host = nullptr,
